@@ -1,6 +1,6 @@
 # mfaCTpy: MicroCT Mouse Brain Registration to Allen CCF
 
-New version available! https://github.com/Sakata-Lab/mfaCTpy2
+**New version available!** https://github.com/Sakata-Lab/mfaCTpy2
 
 ## User Guide v1.1
 
