@@ -2,35 +2,91 @@ import os
 import numpy as np
 import json
 from pathlib import Path
-from tkinter import Tk, filedialog
+import argparse
 import tifffile
 import nrrd
 import matplotlib.pyplot as plt
 
-def select_registered_tif():
-    """Open file dialog to select registered .tif file"""
-    root = Tk()
-    root.withdraw()
-    file_path = filedialog.askopenfilename(
-        title="Select registered .tif file",
-        filetypes=[("TIFF files", "*.tif"), ("All files", "*.*")]
-    )
-    root.destroy()
-    return file_path
+from project_paths import resolve_project_path
 
-def select_ccf_folder():
-    """Open folder dialog to select CCF folder"""
-    root = Tk()
-    root.withdraw()
-    folder_path = filedialog.askdirectory(
-        title="Select folder containing CCF files (annotation_25.nrrd, structure_tree.json)"
-    )
-    root.destroy()
-    return folder_path
 
-def load_structure_tree(ccf_path):
+def first_existing(candidates):
+    for candidate in candidates:
+        candidate = Path(candidate).expanduser()
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def search_project(project, names):
+    direct = []
+    resource_dir = Path(__file__).resolve().parent.parent / "resources" / "allen_ccf"
+    for name in names:
+        direct.extend([
+            project / "data" / "processed" / name,
+            project / "outputs" / name,
+            project / "data" / "ccf" / name,
+            project / name,
+            resource_dir / name,
+        ])
+    found = first_existing(direct)
+    if found:
+        return found
+    for name in names:
+        matches = sorted(project.rglob(name))
+        if matches:
+            return matches[0].resolve()
+    return None
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Create 2D registered microCT/Allen CCF slice overlays."
+    )
+    parser.add_argument(
+        "project_path",
+        nargs="?",
+        help="Project folder. Defaults to the current project folder.",
+    )
+    parser.add_argument(
+        "--image",
+        help="Registered microCT TIFF. Defaults to data/processed/microct_registered.tif.",
+    )
+    parser.add_argument(
+        "--ccf-folder",
+        help="Folder containing annotation_25.nrrd and structure_tree.json.",
+    )
+    parser.add_argument(
+        "--annotation",
+        help="Path to annotation_25.nrrd.",
+    )
+    parser.add_argument(
+        "--structure-tree",
+        help="Path to structure_tree.json.",
+    )
+    parser.add_argument(
+        "--plane",
+        choices=("coronal", "horizontal", "sagittal"),
+        default="coronal",
+        help="Plane to extract as individual grayscale slices.",
+    )
+    parser.add_argument(
+        "--step",
+        type=int,
+        default=1,
+        help="Slice interval. Use a larger number for a faster preview.",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.6,
+        help="MicroCT contribution in overlay images.",
+    )
+    return parser.parse_args()
+
+def load_structure_tree(structure_tree_path):
     """Load and parse structure_tree.json to get region colors"""
-    json_path = os.path.join(ccf_path, "structure_tree.json")
+    json_path = Path(structure_tree_path)
     
     with open(json_path, 'r') as f:
         data = json.load(f)
@@ -303,75 +359,85 @@ def create_section_montage(output_folder, max_sections=20):
     print(f"Montage saved to: {montage_path}")
 
 def main():
+    args = parse_args()
     print("=" * 60)
     print("uCT Registration Viewer with Plane Selection")
     print("=" * 60)
-    
-    # Step 1: Select registered .tif file
-    print("\nStep 1: Select registered microCT .tif file...")
-    tif_path = select_registered_tif()
-    
-    if not tif_path:
-        print("No file selected. Exiting.")
+
+    project = resolve_project_path(args.project_path)
+    tif_path = (
+        Path(args.image).expanduser().resolve()
+        if args.image else search_project(
+            project,
+            ("microct_registered.tif", "microct_registered.tiff"),
+        )
+    )
+    if tif_path is None or not tif_path.exists():
+        print("\nERROR: registered microCT image not found.")
+        print(f"Expected: {project / 'data' / 'processed' / 'microct_registered.tif'}")
+        print("Or pass it explicitly with --image.")
         return
-    
     print(f"Selected: {tif_path}")
-    
-    # Step 2: Select CCF folder
-    print("\nStep 2: Select CCF folder containing Allen CCF files...")
-    ccf_folder = select_ccf_folder()
-    
-    if not ccf_folder:
-        print("No folder selected. Exiting.")
-        return
-    
-    print(f"CCF folder: {ccf_folder}")
-    
-    # Determine paths
-    parent_folder = Path(tif_path).parent.parent
-    outputs_folder = parent_folder / "outputs"
-    
-    print(f"\nParent folder: {parent_folder}")
-    
-    # Verify CCF files exist
-    annotation_path = Path(ccf_folder) / "annotation_25.nrrd"
-    structure_tree_path = Path(ccf_folder) / "structure_tree.json"
-    
+
+    ccf_folder = Path(args.ccf_folder).expanduser().resolve() if args.ccf_folder else None
+    annotation_path = (
+        Path(args.annotation).expanduser().resolve()
+        if args.annotation else (
+            ccf_folder / "annotation_25.nrrd"
+            if ccf_folder else search_project(project, ("annotation_25.nrrd",))
+        )
+    )
+    structure_tree_path = (
+        Path(args.structure_tree).expanduser().resolve()
+        if args.structure_tree else (
+            ccf_folder / "structure_tree.json"
+            if ccf_folder else search_project(project, ("structure_tree.json",))
+        )
+    )
+
     if not annotation_path.exists():
         print(f"ERROR: {annotation_path} not found!")
         return
-    
     if not structure_tree_path.exists():
         print(f"ERROR: {structure_tree_path} not found!")
         return
-    
+
+    print(f"CCF annotation: {annotation_path}")
+    print(f"Structure tree: {structure_tree_path}")
+
+    outputs_folder = project / "outputs"
+    outputs_folder.mkdir(exist_ok=True)
+    print(f"\nProject folder: {project}")
+
     # Step 3: Load data
     print("\nStep 3: Loading microCT data...")
     microct_data = tifffile.imread(tif_path)
     print(f"MicroCT shape: {microct_data.shape}")
-    
-    # Step 4: Show plane selection
-    print("\nStep 4: Selecting extraction plane...")
-    selected_axis = show_plane_selection(microct_data)
-    
-    # Step 5: Extract slices from selected plane
-    print("\nStep 5: Extracting ALL slices from selected plane...")
+
+    # Step 4: Select extraction plane from command-line option
     plane_names = ['coronal', 'horizontal', 'sagittal']
+    selected_axis = plane_names.index(args.plane)
+    print(f"\nStep 4: Selected extraction plane: {args.plane}")
+
+    # Step 5: Extract slices from selected plane
+    if args.step <= 0:
+        raise ValueError("--step must be a positive integer.")
+    print("\nStep 5: Extracting slices from selected plane...")
     slice_folder = outputs_folder / f"{plane_names[selected_axis]}_slices"
     slice_indices = extract_slices(
         microct_data, 
         str(slice_folder), 
         axis=selected_axis,
-        step=1  # Extract ALL slices (step=1)
+        step=args.step
     )
-    
+
     # Step 6: Load Allen CCF data
     print("\nStep 6: Loading Allen CCF annotation...")
     annotation_data, _ = nrrd.read(str(annotation_path))
     print(f"Annotation shape: {annotation_data.shape}")
     
     print("\nStep 7: Loading structure tree and creating color map...")
-    color_map = load_structure_tree(str(ccf_folder))
+    color_map = load_structure_tree(structure_tree_path)
     print(f"Loaded {len(color_map)} brain regions")
     
     print("\nStep 8: Creating colored annotation volume...")
@@ -385,8 +451,8 @@ def main():
         microct_data, 
         annotation_rgb, 
         str(sections_folder),
-        step=1,  # Create overlay for ALL coronal slices
-        alpha=0.6
+        step=args.step,
+        alpha=args.alpha
     )
     
     print("\n" + "=" * 60)

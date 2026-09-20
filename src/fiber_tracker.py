@@ -8,6 +8,8 @@ Dependencies:
 pip install numpy tifffile matplotlib pandas nrrd requests SimpleITK
 """
 
+import sys
+from project_paths import resolve_project_path
 import numpy as np
 import tifffile
 import matplotlib.pyplot as plt
@@ -1109,7 +1111,7 @@ def main():
     print("MICROCT FIBER TRACKER WITH CCF")
     print("="*70)
     
-    PROJECT_PATH = Path(r"C:\DATA\MFA\uCT\uCT2CCF")
+    PROJECT_PATH = resolve_project_path(sys.argv[1] if len(sys.argv) > 1 else None)
     
     # File paths
     aligned_image = PROJECT_PATH / "data" / "processed" / "microct_aligned.tif"

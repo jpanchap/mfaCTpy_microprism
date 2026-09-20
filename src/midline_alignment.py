@@ -5,7 +5,7 @@ Interactive tool for marking midline and correcting image orientation
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Button, Slider
+from matplotlib.widgets import Button, Slider, TextBox
 from scipy import ndimage
 from scipy.spatial.transform import Rotation
 import SimpleITK as sitk
@@ -13,6 +13,17 @@ from pathlib import Path
 import json
 import tifffile
 import time
+import shutil
+from project_paths import resolve_project_path
+
+
+def copy_metadata_sidecar(source_image: Path, output_image: Path) -> None:
+    """Carry image spacing metadata forward when saving derived TIFFs."""
+    source_sidecar = source_image.with_suffix(source_image.suffix + ".metadata.json")
+    output_sidecar = output_image.with_suffix(output_image.suffix + ".metadata.json")
+    if source_sidecar.exists():
+        shutil.copy2(source_sidecar, output_sidecar)
+        print(f"✓ Metadata sidecar saved to: {output_sidecar}")
 
 
 class AxisVerifier:
@@ -53,19 +64,21 @@ class AxisVerifier:
         print("\nIf the views don't match these descriptions, use the buttons to:")
         print("  - Swap axes (e.g., swap Z↔Y if coronal/axial are switched)")
         print("  - Flip axes (mirror the image along an axis)")
+        print("  - Rotate a displayed view by a precise angle in degrees")
+        print("    Positive values rotate clockwise; negative values rotate counter-clockwise")
         print("="*70 + "\n")
         
-        fig = plt.figure(figsize=(18, 12))
+        fig = plt.figure(figsize=(18, 13))
         
         # Create subplots for three views
-        ax_coronal = plt.subplot(2, 3, 1)
-        ax_axial = plt.subplot(2, 3, 2)
-        ax_sagittal = plt.subplot(2, 3, 3)
+        ax_coronal = plt.axes([0.055, 0.58, 0.25, 0.30])
+        ax_axial = plt.axes([0.375, 0.58, 0.25, 0.30])
+        ax_sagittal = plt.axes([0.695, 0.58, 0.25, 0.30])
         
         # Create slider axes
-        ax_slider_cor = plt.axes([0.1, 0.35, 0.2, 0.02])
-        ax_slider_ax = plt.axes([0.4, 0.35, 0.2, 0.02])
-        ax_slider_sag = plt.axes([0.7, 0.35, 0.2, 0.02])
+        ax_slider_cor = plt.axes([0.10, 0.505, 0.20, 0.02])
+        ax_slider_ax = plt.axes([0.40, 0.505, 0.20, 0.02])
+        ax_slider_sag = plt.axes([0.70, 0.505, 0.20, 0.02])
         
         # Current slice indices
         slices = {
@@ -73,55 +86,72 @@ class AxisVerifier:
             'axial': self.corrected_image.shape[1] // 2,
             'sagittal': self.corrected_image.shape[2] // 2
         }
+        rotation_angle = {'degrees': 0.0}
+        rotation_preview_view = {'view': None}
+
+        def preview_slice(slice_2d, view_name):
+            angle = rotation_angle['degrees']
+            if rotation_preview_view['view'] != view_name or abs(angle) < 1e-6:
+                return slice_2d
+            return ndimage.rotate(
+                slice_2d,
+                -angle,
+                reshape=False,
+                order=1,
+                mode='constant',
+                cval=float(np.min(slice_2d)),
+                prefilter=False,
+            )
         
         def update_display():
             """Update all three views"""
             # Coronal (through Z axis)
             ax_coronal.clear()
             cor_slice = self.corrected_image[slices['coronal'], :, :]
-            ax_coronal.imshow(cor_slice, cmap='gray')
-            ax_coronal.axvline(x=cor_slice.shape[1]//2, color='green', 
+            cor_display = preview_slice(cor_slice, 'coronal')
+            ax_coronal.imshow(cor_display, cmap='gray')
+            ax_coronal.axvline(x=cor_display.shape[1]//2, color='green', 
                              linestyle='--', linewidth=1, alpha=0.5)
             ax_coronal.set_title(f'CORONAL (Z={slices["coronal"]})\n'
-                               f'Shape: {cor_slice.shape}\n'
-                               f'Should show: Front/Back view\n'
-                               f'Midline should be vertical',
-                               fontsize=10)
+                               f'Shape: {cor_display.shape} | Front/back | midline vertical',
+                               fontsize=9, pad=5)
             ax_coronal.axis('off')
             
             # Axial (through Y axis)
             ax_axial.clear()
             ax_slice = self.corrected_image[:, slices['axial'], :]
-            ax_axial.imshow(ax_slice, cmap='gray')
-            ax_axial.axvline(x=ax_slice.shape[1]//2, color='green', 
+            ax_display = preview_slice(ax_slice, 'axial')
+            ax_axial.imshow(ax_display, cmap='gray')
+            ax_axial.axvline(x=ax_display.shape[1]//2, color='green', 
                            linestyle='--', linewidth=1, alpha=0.5)
             ax_axial.set_title(f'AXIAL (Y={slices["axial"]})\n'
-                             f'Shape: {ax_slice.shape}\n'
-                             f'Should show: Top-down view\n'
-                             f'Midline should be vertical',
-                             fontsize=10)
+                             f'Shape: {ax_display.shape} | Top-down | midline vertical',
+                             fontsize=9, pad=5)
             ax_axial.axis('off')
             
             # Sagittal (through X axis)
             ax_sagittal.clear()
             sag_slice = self.corrected_image[:, :, slices['sagittal']]
-            ax_sagittal.imshow(sag_slice, cmap='gray')
+            sag_display = preview_slice(sag_slice, 'sagittal')
+            ax_sagittal.imshow(sag_display, cmap='gray')
             ax_sagittal.set_title(f'SAGITTAL (X={slices["sagittal"]})\n'
-                                f'Shape: {sag_slice.shape}\n'
-                                f'Should show: Side view\n'
-                                f'Brain should be visible',
-                                fontsize=10)
+                                f'Shape: {sag_display.shape} | Side view',
+                                fontsize=9, pad=5)
             ax_sagittal.axis('off')
             
             # Update info text
             info_text = (
                 f"Current image shape: {self.corrected_image.shape} (Z, Y, X)\n"
-                f"Use sliders to navigate through slices\n"
-                f"Use buttons below to correct orientation if needed"
+                f"Preview view: {rotation_preview_view['view'] or 'none'} | "
+                f"Angle: {rotation_angle['degrees']:.2f}°"
             )
-            fig.text(0.5, 0.42, info_text, ha='center', fontsize=10,
+            fig.text(0.5, 0.455, info_text, ha='center', fontsize=10,
                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
             
+            apply_zoom(ax_coronal, cor_display.shape)
+            apply_zoom(ax_axial, ax_display.shape)
+            apply_zoom(ax_sagittal, sag_display.shape)
+
             fig.canvas.draw()
         
         # Create sliders
@@ -152,10 +182,10 @@ class AxisVerifier:
         slider_sag.on_changed(update_sagittal)
         
         # Create correction buttons
-        button_height = 0.04
-        button_width = 0.08
-        button_y_start = 0.25
-        button_spacing = 0.01
+        button_height = 0.034
+        button_width = 0.098
+        button_y_start = 0.405
+        button_spacing = 0.012
         
         # Swap buttons
         ax_swap_zy = plt.axes([0.1, button_y_start, button_width, button_height])
@@ -180,14 +210,73 @@ class AxisVerifier:
         btn_flip_y = Button(ax_flip_y, 'Flip Y')
         btn_flip_x = Button(ax_flip_x, 'Flip X')
         
+        # Fine rotation controls
+        button_y_rotate = button_y_flip - button_height - button_spacing
+        ax_rotate_cor = plt.axes([0.1, button_y_rotate, button_width, button_height])
+        ax_rotate_ax = plt.axes([0.1 + button_width + button_spacing, button_y_rotate,
+                                 button_width, button_height])
+        ax_rotate_sag = plt.axes([0.1 + 2*(button_width + button_spacing), button_y_rotate,
+                                  button_width, button_height])
+        ax_angle_slider = plt.axes([0.48, button_y_rotate + 0.009, 0.18, 0.018])
+        ax_angle_text = plt.axes([0.70, button_y_rotate, 0.07, button_height])
+
+        btn_rotate_cor = Button(ax_rotate_cor, 'Rotate Coronal')
+        btn_rotate_ax = Button(ax_rotate_ax, 'Rotate Axial')
+        btn_rotate_sag = Button(ax_rotate_sag, 'Rotate Sagittal')
+        angle_slider = Slider(
+            ax_angle_slider, 'Angle°', -30.0, 30.0, valinit=0.0, valstep=0.1)
+        angle_text = TextBox(ax_angle_text, '', initial='0.0')
+        fig.text(
+            0.78, button_y_rotate + 0.015,
+            'Positive = clockwise, negative = counter-clockwise',
+            ha='left', va='center', fontsize=8)
+
+        # Preview zoom controls
+        button_y_zoom = button_y_rotate - button_height - button_spacing
+        ax_zoom_in = plt.axes([0.1, button_y_zoom, button_width, button_height])
+        ax_zoom_out = plt.axes([0.1 + button_width + button_spacing, button_y_zoom,
+                                button_width, button_height])
+        ax_zoom_reset = plt.axes([0.1 + 2*(button_width + button_spacing), button_y_zoom,
+                                  button_width, button_height])
+
+        btn_zoom_in = Button(ax_zoom_in, 'Zoom +')
+        btn_zoom_out = Button(ax_zoom_out, 'Zoom -')
+        btn_zoom_reset = Button(ax_zoom_reset, 'Zoom 1x')
+
         # Control buttons
-        button_y_control = button_y_flip - button_height - button_spacing
+        button_y_control = button_y_zoom - button_height - button_spacing
         ax_reset = plt.axes([0.1, button_y_control, button_width, button_height])
         ax_done = plt.axes([0.8, button_y_control, button_width, button_height])
         
         btn_reset = Button(ax_reset, 'Reset')
         btn_done = Button(ax_done, 'Done')
         
+        zoom_state = {'factor': 1.0}
+
+        def apply_zoom(axis, image_shape):
+            zoom = zoom_state['factor']
+            if zoom <= 1.0:
+                return
+
+            rows, cols = image_shape
+            center_x = (cols - 1) / 2.0
+            center_y = (rows - 1) / 2.0
+            half_width = cols / (2.0 * zoom)
+            half_height = rows / (2.0 * zoom)
+            axis.set_xlim(center_x - half_width, center_x + half_width)
+            axis.set_ylim(center_y + half_height, center_y - half_height)
+
+        def change_zoom(multiplier):
+            zoom_state['factor'] = float(np.clip(
+                zoom_state['factor'] * multiplier, 1.0, 16.0))
+            print(f"\nPreview zoom: {zoom_state['factor']:.2f}x")
+            update_display()
+
+        def reset_zoom(event):
+            zoom_state['factor'] = 1.0
+            print("\nPreview zoom reset to 1.00x")
+            update_display()
+
         # Transpose operations
         def swap_axes(axis1, axis2):
             print(f"\nSwapping axes {axis1} ↔ {axis2}")
@@ -221,10 +310,46 @@ class AxisVerifier:
             print(f"\nFlipping axis {axis}")
             self.corrected_image = np.flip(self.corrected_image, axis=axis)
             update_display()
+
+        def set_rotation_angle(angle):
+            angle = float(np.clip(angle, -30.0, 30.0))
+            rotation_angle['degrees'] = angle
+            return angle
+
+        def update_angle_from_slider(val):
+            set_rotation_angle(val)
+            update_display()
+
+        def update_angle_from_text(text):
+            try:
+                angle = set_rotation_angle(float(text))
+            except ValueError:
+                print(f"Could not parse rotation angle: {text!r}")
+                return
+            angle_slider.set_val(angle)
+            update_display()
+
+        def rotate_view(view_name):
+            angle = rotation_angle['degrees']
+            rotation_preview_view['view'] = view_name
+            if abs(angle) < 1e-6:
+                print(f"\nSelected {view_name} rotation preview. Enter a nonzero angle to preview.")
+                update_display()
+                return
+
+            print(f"\nPreviewing {view_name} view at {angle:.3f}°")
+            print("  Positive angles are clockwise in the displayed view.")
+            print("  This is display-only and will not change saved image geometry.")
+            update_display()
         
         def reset_image(event):
             print("\nResetting to original image")
             self.corrected_image = self.image.copy()
+            set_rotation_angle(0.0)
+            angle_slider.set_val(0.0)
+            angle_text.set_val('0.0')
+            zoom_state['factor'] = 1.0
+            rotation_preview_view['view'] = None
             
             # Reset sliders
             slider_cor.valmin = 0
@@ -256,26 +381,30 @@ class AxisVerifier:
         btn_flip_z.on_clicked(lambda e: flip_axis(0))
         btn_flip_y.on_clicked(lambda e: flip_axis(1))
         btn_flip_x.on_clicked(lambda e: flip_axis(2))
+        btn_rotate_cor.on_clicked(lambda e: rotate_view('coronal'))
+        btn_rotate_ax.on_clicked(lambda e: rotate_view('axial'))
+        btn_rotate_sag.on_clicked(lambda e: rotate_view('sagittal'))
+        angle_slider.on_changed(update_angle_from_slider)
+        angle_text.on_submit(update_angle_from_text)
+        btn_zoom_in.on_clicked(lambda e: change_zoom(1.25))
+        btn_zoom_out.on_clicked(lambda e: change_zoom(0.8))
+        btn_zoom_reset.on_clicked(reset_zoom)
         
         btn_reset.on_clicked(reset_image)
         btn_done.on_clicked(done)
         
         # Add instructions
         instructions = (
-            "INSTRUCTIONS:\n"
-            "1. Check if each view matches its expected orientation\n"
-            "2. If views are swapped (e.g., coronal shows top-down), use Swap buttons\n"
-            "3. If views are mirrored incorrectly, use Flip buttons\n"
-            "4. Use sliders to navigate through slices and verify\n"
-            "5. Click 'Done' when orientation is correct"
+            "Enter degrees, then choose Rotate Coronal / Axial / Sagittal. "
+            "Positive = clockwise, negative = counter-clockwise.\n"
+            "Rotation is a selected-view preview only; saved volume geometry is unchanged."
         )
-        fig.text(0.5, 0.08, instructions, ha='center', fontsize=9,
+        fig.text(0.52, 0.055, instructions, ha='center', fontsize=8,
                 bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
         
         # Initial display
         update_display()
         
-        plt.tight_layout(rect=[0, 0.12, 1, 0.95])
         plt.show()
         
         print("\n" + "="*70)
@@ -926,11 +1055,16 @@ class MidlineAligner:
 if __name__ == "__main__":
     from data_loader import DataLoader
     
-    PROJECT_PATH = Path(r"C:\DATA\MFA\uCT\uCT2CCF")
+    import sys
+    PROJECT_PATH = resolve_project_path(sys.argv[1] if len(sys.argv) > 1 else None)
     
     # Load microCT data
     print("Loading microCT data...")
     loader = DataLoader(PROJECT_PATH)
+    source_image_path = next(
+        iter(sorted(loader.data_path.glob("*.tif")) + sorted(loader.data_path.glob("*.tiff"))),
+        None,
+    )
     microct = loader.load_microct()
     
     # Initialize aligner
@@ -997,6 +1131,8 @@ if __name__ == "__main__":
                 print(f"\nSaving axis-corrected image (this may take a few minutes)...")
                 tifffile.imwrite(output_file, corrected_image)
                 print(f"✓ Axis-corrected image saved to: {output_file}")
+                if source_image_path is not None:
+                    copy_metadata_sidecar(source_image_path, output_file)
                 
                 # Update the aligned image reference
                 aligned_image = corrected_image
@@ -1014,6 +1150,8 @@ if __name__ == "__main__":
             print(f"\nSaving aligned image (this may take a few minutes)...")
             tifffile.imwrite(output_file, aligned_image)
             print(f"✓ Aligned image saved to: {output_file}")
+            if source_image_path is not None:
+                copy_metadata_sidecar(source_image_path, output_file)
         
         print("\n" + "="*60)
         print("NEXT STEPS")

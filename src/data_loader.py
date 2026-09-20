@@ -188,7 +188,7 @@ class DataLoader:
 # Example usage
 if __name__ == "__main__":
     # Set your project path
-    PROJECT_PATH = r"C:\DATA\MFA\uCT\uCT2CCF"
+    PROJECT_PATH = "/Users/jojop/Downloads/stuber-lab/uCT2CCF"
     
     # Initialize loader
     loader = DataLoader(PROJECT_PATH)

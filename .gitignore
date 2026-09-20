@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Downloaded Allen CCF resources are cached once per installation.
+resources/allen_ccf/*.nrrd
+resources/allen_ccf/structure_tree.json
+resources/allen_ccf/*.part

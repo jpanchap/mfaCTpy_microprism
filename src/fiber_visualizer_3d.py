@@ -21,6 +21,12 @@ from mpl_toolkits.mplot3d.art3d import Line3D
 import tifffile
 import json
 from pathlib import Path
+import argparse
+
+try:
+    from project_paths import resolve_project_path
+except ImportError:
+    resolve_project_path = None
 
 
 class FiberVisualizer3D:
@@ -561,32 +567,113 @@ class FiberVisualizer3D:
         plt.show()
 
 
+def first_existing(candidates):
+    for candidate in candidates:
+        candidate = Path(candidate).expanduser()
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def search_project(project_path, names):
+    direct = []
+    for name in names:
+        direct.extend([
+            project_path / "data" / "processed" / name,
+            project_path / "outputs" / name,
+            project_path / "data" / "ccf" / name,
+            project_path / name,
+        ])
+    found = first_existing(direct)
+    if found:
+        return found
+    for name in names:
+        matches = sorted(project_path.rglob(name))
+        if matches:
+            return matches[0].resolve()
+    return None
+
+
+def resolve_project(project_arg):
+    if resolve_project_path is not None:
+        return resolve_project_path(project_arg)
+    if project_arg:
+        project = Path(project_arg).expanduser().resolve()
+        print(f"Project path: {project}")
+        return project
+    project = Path.cwd().expanduser().resolve()
+    print(f"Project path: {project} (current folder)")
+    return project
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Interactive 3D fiber visualizer.")
+    parser.add_argument(
+        "project_path",
+        nargs="?",
+        help="Project folder. Defaults to the current project folder.",
+    )
+    parser.add_argument(
+        "--image",
+        help="Path to registered microCT image. Defaults to data/processed/microct_registered.tif.",
+    )
+    parser.add_argument(
+        "--fibers",
+        help="Path to fiber_data.json. Defaults to outputs/fiber_data.json.",
+    )
+    parser.add_argument(
+        "--ccf",
+        help="Path to Allen CCF template/annotation. Defaults to project data/ccf or shared resources.",
+    )
+    return parser.parse_args()
+
+
 def main():
     """Main function"""
     print("="*70)
     print("INTERACTIVE 3D FIBER VISUALIZER")
     print("="*70)
-    
-    PROJECT_PATH = Path(r"C:\DATA\MFA\uCT\uCT2CCF")
+
+    args = parse_args()
+    PROJECT_PATH = resolve_project(args.project_path)
     
     # File paths
-    image_path = PROJECT_PATH / "data" / "processed" / "microct_registered.tif"
-    fiber_data_path = PROJECT_PATH / "outputs" / "fiber_data.json"
+    image_path = (
+        Path(args.image).expanduser().resolve()
+        if args.image else search_project(
+            PROJECT_PATH,
+            ("microct_registered.tif", "microct_registered.tiff"),
+        )
+    )
+    fiber_data_path = (
+        Path(args.fibers).expanduser().resolve()
+        if args.fibers else search_project(PROJECT_PATH, ("fiber_data.json",))
+    )
     
     # Allen CCF options - try in order of preference
-    ccf_options = [
+    resource_dir = Path(__file__).resolve().parent.parent / "resources" / "allen_ccf"
+    ccf_candidates = [
         ("Allen CCF Template (25um)", PROJECT_PATH / "data" / "ccf" / "average_template_25.nrrd"),
+        ("Allen CCF Template (25um shared)", resource_dir / "average_template_25.nrrd"),
         ("Allen CCF Template (10um)", PROJECT_PATH / "data" / "ccf" / "average_template_10.nrrd"),
         ("Allen CCF Annotation (25um)", PROJECT_PATH / "data" / "ccf" / "annotation_25.nrrd"),
+        ("Allen CCF Annotation (25um shared)", resource_dir / "annotation_25.nrrd"),
         ("Allen CCF Annotation (10um)", PROJECT_PATH / "data" / "ccf" / "annotation_10.nrrd"),
     ]
     
-    ccf_path = None
-    for name, path in ccf_options:
-        if path.exists():
-            ccf_path = path
-            print(f"\n✓ Found {name}: {path}")
-            break
+    if args.ccf:
+        ccf_path = Path(args.ccf).expanduser().resolve()
+        if not ccf_path.exists():
+            print(f"\n❌ ERROR: Allen CCF file not found: {ccf_path}")
+            return
+        print(f"\n✓ Using Allen CCF: {ccf_path}")
+    else:
+        ccf_path = None
+        for name, path in ccf_candidates:
+            if path.exists():
+                ccf_path = path.resolve()
+                print(f"\n✓ Found {name}: {path}")
+                break
     
     if ccf_path is None:
         print(f"\n⚠️  Allen CCF not found (will use microCT only)")
@@ -596,13 +683,17 @@ def main():
         print(f"\nThe template (MRI-like) is better for visualization than annotation.")
     
     # Check required files exist
-    if not image_path.exists():
+    if image_path is None or not image_path.exists():
         print(f"\n❌ ERROR: Image not found: {image_path}")
+        print("Expected a registered microCT image such as:")
+        print(f"  {PROJECT_PATH / 'data' / 'processed' / 'microct_registered.tif'}")
+        print("Or pass it explicitly with --image.")
         return
     
-    if not fiber_data_path.exists():
+    if fiber_data_path is None or not fiber_data_path.exists():
         print(f"\n❌ ERROR: Fiber data not found: {fiber_data_path}")
-        print("Run fiber_tracker.py first to track fibers!")
+        print("Run fiber_tracker.py first to track fibers, or pass an existing file with --fibers.")
+        print(f"Expected: {PROJECT_PATH / 'outputs' / 'fiber_data.json'}")
         return
     
     # Create visualizer

@@ -12,6 +12,8 @@ from pathlib import Path
 import json
 import tifffile
 from scipy import ndimage
+import argparse
+from project_paths import resolve_project_path
 
 
 class LandmarkSelector:
@@ -62,6 +64,11 @@ class LandmarkSelector:
         # Store image artists to update data directly for performance
         self.im_moving = None
         self.im_fixed = None
+        self.zoom_factor = {"moving": 1.0, "fixed": 1.0}
+        self.zoom_center = {"moving": None, "fixed": None}
+        self.active_panel = "moving"
+        self.pan_mode = False
+        self._pan_anchor = None
 
     def get_slice(self, image, slice_idx, view='Z'):
         """Get 2D slice from 3D image based on view
@@ -87,15 +94,171 @@ class LandmarkSelector:
             return image.shape[1] - 1
         elif view == 'X':
             return image.shape[2] - 1
+
+    def get_display_shape(self, image, view):
+        """Return displayed slice width/height for a view."""
+        sample_slice = self.get_slice(image, 0, view)
+        height, width = sample_slice.shape
+        return int(width), int(height)
+
+    def set_active_panel_from_axes(self, axes):
+        """Track which image panel zoom controls should affect."""
+        if axes == self.ax_moving:
+            self.active_panel = "moving"
+        elif axes == self.ax_fixed:
+            self.active_panel = "fixed"
+
+    def default_zoom_center(self, panel):
+        """Use the center of the currently displayed slice."""
+        image = self.moving_image if panel == "moving" else self.fixed_image
+        width, height = self.get_display_shape(image, self.view)
+        return (width - 1) / 2.0, (height - 1) / 2.0
+
+    def change_zoom(self, panel, scale, center=None):
+        """Zoom one panel for display only; landmark coordinates are unchanged."""
+        self.zoom_factor[panel] = float(np.clip(
+            self.zoom_factor[panel] * scale, 1.0, 24.0
+        ))
+        if center is not None:
+            self.zoom_center[panel] = center
+        elif self.zoom_center[panel] is None:
+            self.zoom_center[panel] = self.default_zoom_center(panel)
+        self.update_display()
+
+    def reset_zoom(self, panel=None):
+        """Reset zoom for one panel or both panels."""
+        panels = ("moving", "fixed") if panel is None else (panel,)
+        for name in panels:
+            self.zoom_factor[name] = 1.0
+            self.zoom_center[name] = None
+        self.update_display()
+
+    @staticmethod
+    def clamp_axis_limits(limits, size):
+        """Clamp axes limits to image bounds while preserving direction."""
+        first, second = float(limits[0]), float(limits[1])
+        reversed_axis = first > second
+        lower, upper = (second, first) if reversed_axis else (first, second)
+        span = upper - lower
+
+        min_edge = -0.5
+        max_edge = float(size) - 0.5
+        if span >= max_edge - min_edge:
+            lower = min_edge
+        else:
+            lower = float(np.clip(lower, min_edge, max_edge - span))
+        upper = lower + span
+
+        return (upper, lower) if reversed_axis else (lower, upper)
+
+    def toggle_pan(self, enabled=None):
+        """Toggle display-only panning for zoomed images."""
+        self.pan_mode = (not self.pan_mode) if enabled is None else bool(enabled)
+        self._pan_anchor = None
+        self.update_display()
+
+    def begin_pan(self, event):
+        """Start dragging the current image view."""
+        if event.inaxes not in (self.ax_moving, self.ax_fixed):
+            return False
+        if event.xdata is None or event.ydata is None:
+            return False
+
+        panel = "moving" if event.inaxes == self.ax_moving else "fixed"
+        self.set_active_panel_from_axes(event.inaxes)
+        self._pan_anchor = {
+            "panel": panel,
+            "axes": event.inaxes,
+            "x": float(event.xdata),
+            "y": float(event.ydata),
+            "xlim": tuple(event.inaxes.get_xlim()),
+            "ylim": tuple(event.inaxes.get_ylim()),
+        }
+        return True
+
+    def drag_pan(self, event):
+        """Move the zoomed display window without changing landmarks."""
+        if self._pan_anchor is None:
+            return
+        if event.inaxes != self._pan_anchor["axes"]:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        panel = self._pan_anchor["panel"]
+        image = self.moving_image if panel == "moving" else self.fixed_image
+        width, height = self.get_display_shape(image, self.view)
+
+        dx = self._pan_anchor["x"] - float(event.xdata)
+        dy = self._pan_anchor["y"] - float(event.ydata)
+        xlim = (
+            self._pan_anchor["xlim"][0] + dx,
+            self._pan_anchor["xlim"][1] + dx,
+        )
+        ylim = (
+            self._pan_anchor["ylim"][0] + dy,
+            self._pan_anchor["ylim"][1] + dy,
+        )
+
+        event.inaxes.set_xlim(*self.clamp_axis_limits(xlim, width))
+        event.inaxes.set_ylim(*self.clamp_axis_limits(ylim, height))
+
+        x0, x1 = event.inaxes.get_xlim()
+        y0, y1 = event.inaxes.get_ylim()
+        self.zoom_center[panel] = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        self._pan_anchor.update({
+            "x": float(event.xdata),
+            "y": float(event.ydata),
+            "xlim": tuple(event.inaxes.get_xlim()),
+            "ylim": tuple(event.inaxes.get_ylim()),
+        })
+        self.fig.canvas.draw_idle()
+
+    def end_pan(self, event=None):
+        """Stop dragging the image view."""
+        self._pan_anchor = None
+
+    def apply_zoom_to_axes(self, axes, panel):
+        """Apply stored zoom limits to an axes without altering image data."""
+        image = self.moving_image if panel == "moving" else self.fixed_image
+        width, height = self.get_display_shape(image, self.view)
+        if self.zoom_factor[panel] <= 1.001:
+            axes.set_xlim(-0.5, width - 0.5)
+            axes.set_ylim(height - 0.5, -0.5)
+            return
+
+        if self.zoom_center[panel] is None:
+            cx, cy = self.default_zoom_center(panel)
+        else:
+            cx, cy = self.zoom_center[panel]
+
+        half_w = width / (2.0 * self.zoom_factor[panel])
+        half_h = height / (2.0 * self.zoom_factor[panel])
+        xmin = float(np.clip(cx - half_w, -0.5, max(-0.5, width - 2 * half_w - 0.5)))
+        xmax = xmin + 2 * half_w
+        ymin = float(np.clip(cy - half_h, -0.5, max(-0.5, height - 2 * half_h - 0.5)))
+        ymax = ymin + 2 * half_h
+        axes.set_xlim(xmin, xmax)
+        axes.set_ylim(ymax, ymin)
     
     def onclick(self, event):
         """Handle mouse clicks for landmark selection"""
         if event.inaxes is None or event.button != 1:
             return
+        if event.inaxes not in (self.ax_moving, self.ax_fixed):
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        self.set_active_panel_from_axes(event.inaxes)
+
+        if self.pan_mode:
+            self.begin_pan(event)
+            return
         
         x, y = int(event.xdata), int(event.ydata)
         
         if event.inaxes == self.ax_moving:
+            self.zoom_center["moving"] = (float(x), float(y))
             # Convert 2D click to 3D coordinate based on current view
             if self.view == 'Z':
                 landmark = (self.moving_slice, y, x)  # (Z, Y, X)
@@ -117,6 +280,7 @@ class LandmarkSelector:
             self.moving_plots.append({'marker': marker, 'text': text})
             
         elif event.inaxes == self.ax_fixed:
+            self.zoom_center["fixed"] = (float(x), float(y))
             if len(self.fixed_landmarks) >= len(self.moving_landmarks):
                 print("WARNING: Select a point on the moving image first!")
                 return
@@ -166,15 +330,25 @@ class LandmarkSelector:
             plane_desc = 'Z-Y plane'
         
         # Update titles
-        title_moving = (f'{self.moving_name} - Slice through {self.view} axis\n'
-                       f'Viewing: {plane_desc} | Slice {self.moving_slice}/{self.get_max_slice(self.moving_image, self.view)}\n'
-                       f'Landmarks: {len(self.moving_landmarks)}')
-        self.ax_moving.set_title(title_moving, fontsize=11)
+        title_moving = (
+            f"{self.moving_name}\n"
+            f"{plane_desc} | slice {self.moving_slice}/"
+            f"{self.get_max_slice(self.moving_image, self.view)} | "
+            f"zoom {self.zoom_factor['moving']:.1f}x | "
+            f"pan {'on' if self.pan_mode else 'off'} | "
+            f"landmarks {len(self.moving_landmarks)}"
+        )
+        self.ax_moving.set_title(title_moving, fontsize=9, pad=8)
         
-        title_fixed = (f'{self.fixed_name} - Slice through {self.view} axis\n'
-                      f'Viewing: {plane_desc} | Slice {self.fixed_slice}/{self.get_max_slice(self.fixed_image, self.view)}\n'
-                      f'Landmarks: {len(self.fixed_landmarks)}')
-        self.ax_fixed.set_title(title_fixed, fontsize=11)
+        title_fixed = (
+            f"{self.fixed_name}\n"
+            f"{plane_desc} | slice {self.fixed_slice}/"
+            f"{self.get_max_slice(self.fixed_image, self.view)} | "
+            f"zoom {self.zoom_factor['fixed']:.1f}x | "
+            f"pan {'on' if self.pan_mode else 'off'} | "
+            f"landmarks {len(self.fixed_landmarks)}"
+        )
+        self.ax_fixed.set_title(title_fixed, fontsize=9, pad=8)
 
         # Update landmark visibility based on current slice
         for idx, lm in enumerate(self.moving_landmarks):
@@ -204,6 +378,8 @@ class LandmarkSelector:
                              ha='center', va='top',
                              bbox=dict(boxstyle='round', facecolor='red', alpha=0.7))
 
+        self.apply_zoom_to_axes(self.ax_moving, "moving")
+        self.apply_zoom_to_axes(self.ax_fixed, "fixed")
         self.fig.canvas.draw_idle()
 
     def on_undo(self, event):
@@ -258,16 +434,20 @@ class LandmarkSelector:
         print("  - 'z': Switch to Z-axis view")
         print("  - 'y': Switch to Y-axis view")
         print("  - 'x': Switch to X-axis view")
+        print("  - Use MicroCT/Allen zoom buttons to zoom either image")
+        print("  - 'p': Toggle pan mode; drag either zoomed image to move around")
+        print("  - '+/-/0': Zoom active image in/out/reset")
         print("  - 'l': List all landmarks")
         print("  - 'Enter': Done")
         print("="*70 + "\n")
         
         self.fig = plt.figure(figsize=(18, 10))
+        self.fig.subplots_adjust(left=0.04, right=0.96, top=0.88, bottom=0.08)
         
         # Adjust layout to leave more space at bottom for controls
-        # Images will be in upper 75% of figure
-        self.ax_moving = plt.axes([0.05, 0.30, 0.42, 0.65])
-        self.ax_fixed = plt.axes([0.53, 0.30, 0.42, 0.65])
+        # Images sit below the title band and above sliders/buttons.
+        self.ax_moving = plt.axes([0.06, 0.34, 0.40, 0.52])
+        self.ax_fixed = plt.axes([0.54, 0.34, 0.40, 0.52])
 
         # Create imshow artists once for performance
         moving_slice_data = self.get_slice(self.moving_image, self.moving_slice, self.view)
@@ -280,15 +460,15 @@ class LandmarkSelector:
         self.ax_fixed.axis('off')
 
         # Add sliders - positioned below the images
-        ax_slider_moving = plt.axes([0.12, 0.20, 0.35, 0.02])
-        ax_slider_fixed = plt.axes([0.57, 0.20, 0.35, 0.02])
+        ax_slider_moving = plt.axes([0.14, 0.235, 0.27, 0.025])
+        ax_slider_fixed = plt.axes([0.64, 0.235, 0.27, 0.025])
         
         max_moving = self.get_max_slice(self.moving_image, self.view)
         max_fixed = self.get_max_slice(self.fixed_image, self.view)
         
         self.slider_moving = Slider(
             ax_slider_moving, 
-            f'Moving (through {self.view})',
+            f'Moving {self.view}',
             0, 
             max_moving,
             valinit=self.moving_slice,
@@ -297,7 +477,7 @@ class LandmarkSelector:
         
         self.slider_fixed = Slider(
             ax_slider_fixed,
-            f'Fixed (through {self.view})',
+            f'Fixed {self.view}',
             0,
             max_fixed,
             valinit=self.fixed_slice,
@@ -314,17 +494,30 @@ class LandmarkSelector:
         
         self.slider_moving.on_changed(update_moving_slice)
         self.slider_fixed.on_changed(update_fixed_slice)
+        self.slider_moving.label.set_fontsize(9)
+        self.slider_fixed.label.set_fontsize(9)
+        self.slider_moving.valtext.set_fontsize(9)
+        self.slider_fixed.valtext.set_fontsize(9)
         
         # Add buttons - positioned at the bottom
         # Row 1: View controls
-        ax_view_z = plt.axes([0.12, 0.12, 0.08, 0.04])
-        ax_view_y = plt.axes([0.21, 0.12, 0.08, 0.04])
-        ax_view_x = plt.axes([0.30, 0.12, 0.08, 0.04])
+        ax_view_z = plt.axes([0.14, 0.145, 0.075, 0.04])
+        ax_view_y = plt.axes([0.225, 0.145, 0.075, 0.04])
+        ax_view_x = plt.axes([0.31, 0.145, 0.075, 0.04])
         
         # Row 2: Action buttons
-        ax_list = plt.axes([0.50, 0.12, 0.08, 0.04])
-        ax_undo = plt.axes([0.59, 0.12, 0.08, 0.04])
-        ax_done = plt.axes([0.77, 0.12, 0.10, 0.04])
+        ax_list = plt.axes([0.54, 0.145, 0.075, 0.04])
+        ax_undo = plt.axes([0.625, 0.145, 0.075, 0.04])
+        ax_done = plt.axes([0.82, 0.145, 0.10, 0.04])
+
+        # Row 3-4: separate zoom controls for each image panel.
+        ax_zoom_moving_in = plt.axes([0.08, 0.085, 0.08, 0.036])
+        ax_zoom_moving_out = plt.axes([0.172, 0.085, 0.08, 0.036])
+        ax_zoom_moving_reset = plt.axes([0.264, 0.085, 0.08, 0.036])
+        ax_zoom_fixed_in = plt.axes([0.08, 0.035, 0.08, 0.036])
+        ax_zoom_fixed_out = plt.axes([0.172, 0.035, 0.08, 0.036])
+        ax_zoom_fixed_reset = plt.axes([0.264, 0.035, 0.08, 0.036])
+        ax_pan = plt.axes([0.38, 0.06, 0.095, 0.04])
         
         btn_view_z = Button(ax_view_z, 'Z-axis')
         btn_view_y = Button(ax_view_y, 'Y-axis')
@@ -332,6 +525,18 @@ class LandmarkSelector:
         btn_list = Button(ax_list, 'List All', color='lightblue')
         btn_undo = Button(ax_undo, 'Undo', color='lightyellow')
         btn_done = Button(ax_done, 'Done', color='lightgreen')
+        btn_zoom_moving_in = Button(ax_zoom_moving_in, 'MicroCT +')
+        btn_zoom_moving_out = Button(ax_zoom_moving_out, 'MicroCT -')
+        btn_zoom_moving_reset = Button(ax_zoom_moving_reset, 'MicroCT 1x')
+        btn_zoom_fixed_in = Button(ax_zoom_fixed_in, 'Allen +')
+        btn_zoom_fixed_out = Button(ax_zoom_fixed_out, 'Allen -')
+        btn_zoom_fixed_reset = Button(ax_zoom_fixed_reset, 'Allen 1x')
+        btn_pan = Button(ax_pan, 'Pan off')
+        for button in (
+            btn_zoom_moving_in, btn_zoom_moving_out, btn_zoom_moving_reset,
+            btn_zoom_fixed_in, btn_zoom_fixed_out, btn_zoom_fixed_reset,
+        ):
+            button.label.set_fontsize(9)
         
         def on_done(event):
             if len(self.moving_landmarks) != len(self.fixed_landmarks):
@@ -361,19 +566,29 @@ class LandmarkSelector:
             
             self.moving_slice = max_mov // 2
             self.fixed_slice = max_fix // 2
+            self.zoom_factor = {"moving": 1.0, "fixed": 1.0}
+            self.zoom_center = {"moving": None, "fixed": None}
             
             self.slider_moving.valmin = 0
             self.slider_moving.valmax = max_mov
             self.slider_moving.set_val(self.moving_slice)
-            self.slider_moving.label.set_text(f'Moving (through {self.view})')
+            self.slider_moving.label.set_text(f'Moving {self.view}')
             
             self.slider_fixed.valmin = 0
             self.slider_fixed.valmax = max_fix
             self.slider_fixed.set_val(self.fixed_slice)
-            self.slider_fixed.label.set_text(f'Fixed (through {self.view})')
+            self.slider_fixed.label.set_text(f'Fixed {self.view}')
             
             print(f"\nSwitched to {self.view}-axis view")
             self.update_display()
+
+        def set_pan_mode(enabled):
+            self.toggle_pan(enabled)
+            btn_pan.label.set_text('Pan on' if self.pan_mode else 'Pan off')
+            print(f"Pan mode {'on' if self.pan_mode else 'off'}")
+
+        def on_pan(event):
+            set_pan_mode(not self.pan_mode)
         
         btn_done.on_clicked(on_done)
         btn_undo.on_clicked(self.on_undo)
@@ -381,20 +596,51 @@ class LandmarkSelector:
         btn_view_z.on_clicked(lambda e: change_view('Z'))
         btn_view_y.on_clicked(lambda e: change_view('Y'))
         btn_view_x.on_clicked(lambda e: change_view('X'))
+        btn_zoom_moving_in.on_clicked(lambda e: self.change_zoom("moving", 1.5))
+        btn_zoom_moving_out.on_clicked(lambda e: self.change_zoom("moving", 1/1.5))
+        btn_zoom_moving_reset.on_clicked(lambda e: self.reset_zoom("moving"))
+        btn_zoom_fixed_in.on_clicked(lambda e: self.change_zoom("fixed", 1.5))
+        btn_zoom_fixed_out.on_clicked(lambda e: self.change_zoom("fixed", 1/1.5))
+        btn_zoom_fixed_reset.on_clicked(lambda e: self.reset_zoom("fixed"))
+        btn_pan.on_clicked(on_pan)
         
         # Connect events
         self.fig.canvas.mpl_connect('button_press_event', self.onclick)
+
+        def on_motion(event):
+            if self._pan_anchor is not None:
+                self.drag_pan(event)
+                return
+            if event.inaxes in (self.ax_moving, self.ax_fixed):
+                self.set_active_panel_from_axes(event.inaxes)
+
+        self.fig.canvas.mpl_connect('motion_notify_event', on_motion)
+        self.fig.canvas.mpl_connect('button_release_event', self.end_pan)
         
         def on_scroll(event):
             if event.inaxes == self.ax_moving:
+                self.active_panel = "moving"
                 max_slice = self.get_max_slice(self.moving_image, self.view)
+                if event.key in ("control", "ctrl", "cmd", "super"):
+                    center = None
+                    if event.xdata is not None and event.ydata is not None:
+                        center = (float(event.xdata), float(event.ydata))
+                    self.change_zoom("moving", 1.25 if event.button == "up" else 1/1.25, center)
+                    return
                 if event.button == 'up':
                     self.moving_slice = min(self.moving_slice + 1, max_slice)
                 else:
                     self.moving_slice = max(self.moving_slice - 1, 0)
                 self.slider_moving.set_val(self.moving_slice)
             elif event.inaxes == self.ax_fixed:
+                self.active_panel = "fixed"
                 max_slice = self.get_max_slice(self.fixed_image, self.view)
+                if event.key in ("control", "ctrl", "cmd", "super"):
+                    center = None
+                    if event.xdata is not None and event.ydata is not None:
+                        center = (float(event.xdata), float(event.ydata))
+                    self.change_zoom("fixed", 1.25 if event.button == "up" else 1/1.25, center)
+                    return
                 if event.button == 'up':
                     self.fixed_slice = min(self.fixed_slice + 1, max_slice)
                 else:
@@ -418,6 +664,14 @@ class LandmarkSelector:
                 change_view('X')
             elif event.key == 'l':
                 on_list(None)
+            elif event.key in ('+', '='):
+                self.change_zoom(self.active_panel, 1.5)
+            elif event.key in ('-', '_'):
+                self.change_zoom(self.active_panel, 1/1.5)
+            elif event.key == '0':
+                self.reset_zoom(self.active_panel)
+            elif event.key == 'p':
+                set_pan_mode(not self.pan_mode)
         
         self.fig.canvas.mpl_connect('key_press_event', on_key)
         
@@ -481,6 +735,15 @@ class LandmarkRegistration:
                               moving_spacing, fixed_spacing):
         """Compute registration error for each landmark pair"""
         errors = []
+
+        try:
+            moving_to_fixed = transform.GetInverse()
+        except RuntimeError:
+            moving_to_fixed = None
+            print(
+                "WARNING: could not invert registration transform for landmark "
+                "error calculation. Reporting fixed-to-moving error instead."
+            )
         
         for m_lm, f_lm in zip(moving_landmarks, fixed_landmarks):
             # Convert from (Z,Y,X) to physical coordinates (x,y,z)
@@ -491,11 +754,19 @@ class LandmarkRegistration:
                      f_lm[1] * fixed_spacing[1],    # Y
                      f_lm[0] * fixed_spacing[2]]    # Z
             
-            # Transform moving landmark
-            m_transformed = transform.TransformPoint(m_phys)
-            
-            # Compute Euclidean distance
-            error = np.sqrt(sum((m_transformed[i] - f_phys[i])**2 for i in range(3)))
+            if moving_to_fixed is not None:
+                # The transform used by Resample maps fixed/output points into
+                # moving/input space. Invert it to compare moving landmarks in
+                # fixed atlas physical coordinates.
+                m_transformed = moving_to_fixed.TransformPoint(m_phys)
+                reference = f_phys
+            else:
+                m_transformed = transform.TransformPoint(f_phys)
+                reference = m_phys
+
+            error = np.sqrt(
+                sum((m_transformed[i] - reference[i])**2 for i in range(3))
+            )
             errors.append(error)
         
         return np.array(errors)
@@ -921,12 +1192,115 @@ class LandmarkRegistration:
         return transform
 
 
+def prompt_spacing_um() -> float:
+    """Ask for positive isotropic microCT spacing in micrometers."""
+    while True:
+        raw = input(
+            "\nCould not determine microCT voxel spacing automatically.\n"
+            "Enter microCT voxel spacing in micrometers, e.g. 72: "
+        ).strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            print("Please enter a number, for example 72.")
+            continue
+        if value <= 0:
+            print("Spacing must be positive.")
+            continue
+        return value
+
+
+def infer_spacing_um(image_path: Path) -> float | None:
+    """Infer isotropic image spacing from a metadata sidecar if available."""
+    sidecar_path = image_path.with_suffix(image_path.suffix + ".metadata.json")
+    if sidecar_path.exists():
+        with open(sidecar_path, "r") as f:
+            metadata = json.load(f)
+
+        values = metadata.get("spacing_um_xyz") or metadata.get("spacing_um_zyx")
+        spacing = isotropic_spacing_from_values(values, "metadata sidecar")
+        if spacing is not None:
+            return spacing
+
+    try:
+        with tifffile.TiffFile(image_path) as tif:
+            imagej_metadata = tif.imagej_metadata or {}
+            unit = str(imagej_metadata.get("unit", "")).lower()
+            spacing = imagej_metadata.get("spacing")
+            x_resolution = tif.pages[0].tags.get("XResolution")
+            y_resolution = tif.pages[0].tags.get("YResolution")
+            resolution_unit = tif.pages[0].tags.get("ResolutionUnit")
+    except Exception:
+        return None
+
+    if spacing is not None and unit in {"um", "µm", "micron", "microns"}:
+        print(f"✓ Inferred microCT spacing from ImageJ TIFF metadata: {float(spacing):g} um")
+        return float(spacing)
+
+    if x_resolution and y_resolution and resolution_unit:
+        unit_name = str(resolution_unit.value).upper()
+        if unit_name in {"CENTIMETER", "INCH"}:
+            x_per_unit = rational_to_float(x_resolution.value)
+            y_per_unit = rational_to_float(y_resolution.value)
+            unit_um = 10000.0 if unit_name == "CENTIMETER" else 25400.0
+            values = [unit_um / x_per_unit, unit_um / y_per_unit]
+            return isotropic_spacing_from_values(values, "TIFF resolution tags")
+
+    return None
+
+
+def rational_to_float(value) -> float:
+    try:
+        numerator, denominator = value
+        return float(numerator) / float(denominator)
+    except TypeError:
+        return float(value)
+
+
+def isotropic_spacing_from_values(values, source: str) -> float | None:
+    if not values:
+        return None
+
+    values = [float(v) for v in values]
+    if any(v <= 0 for v in values):
+        return None
+    if max(values) - min(values) > 1e-6:
+        print(
+            f"\nWARNING: {source} spacing is anisotropic: {values} um. "
+            "This registration entry point currently uses one isotropic value."
+        )
+        return None
+
+    spacing = values[0]
+    print(f"✓ Inferred microCT spacing from {source}: {spacing:g} um")
+    return spacing
+
+
 # Example usage
 if __name__ == "__main__":
     from data_loader import DataLoader
     from preprocessing import Preprocessor
-    
-    PROJECT_PATH = Path(r"C:\DATA\MFA\uCT\uCT2CCF")
+
+    parser = argparse.ArgumentParser(
+        description="Register the aligned microCT volume to the Allen CCF atlas.")
+    parser.add_argument("project_path", nargs="?",
+                        help="Project folder containing data/ and outputs/.")
+    parser.add_argument(
+        "--microct-spacing", type=float, default=None,
+        help="Input microCT voxel spacing in micrometers before resampling. "
+             "Overrides metadata detection. If omitted and metadata is missing, "
+             "you will be prompted.")
+    parser.add_argument(
+        "--atlas-spacing", type=float, default=25.0,
+        help="Allen CCF atlas spacing in micrometers. Default: 25.")
+    parser.add_argument(
+        "--resample-moving", action="store_true",
+        help="Upsample/downsample the moving microCT to atlas spacing before "
+             "landmark selection. By default, registration keeps the moving "
+             "image in its native voxel grid and uses physical spacing.")
+    args = parser.parse_args()
+
+    PROJECT_PATH = resolve_project_path(args.project_path)
     
     # Load data
     print("="*70)
@@ -941,19 +1315,25 @@ if __name__ == "__main__":
     if corrected_file.exists():
         print(f"\nLoading axis-corrected microCT from: {corrected_file}")
         microct = tifffile.imread(corrected_file)
+        microct_path = corrected_file
         print("✓ Using axis-corrected image")
     elif aligned_file.exists():
         print(f"\nLoading aligned microCT from: {aligned_file}")
         microct = tifffile.imread(aligned_file)
+        microct_path = aligned_file
         print("✓ Using midline-aligned image")
     else:
         print("\nWARNING: No aligned microCT found. Loading original...")
         print("It's recommended to run midline alignment first!")
         microct = loader.load_microct()
+        microct_path = next(
+            iter(sorted(loader.data_path.glob("*.tif")) + sorted(loader.data_path.glob("*.tiff"))),
+            None,
+        )
     
     # Load Allen CCF
-    print("\nLoading Allen CCF atlas (25um resolution)...")
-    loader.load_allen_ccf(resolution=25)
+    print(f"\nLoading Allen CCF atlas ({args.atlas_spacing:g}um resolution)...")
+    loader.load_allen_ccf(resolution=int(args.atlas_spacing))
     atlas = loader.atlas_image
     
     print(f"\nMicroCT shape (Z,Y,X): {microct.shape}")
@@ -965,21 +1345,34 @@ if __name__ == "__main__":
     print("="*70)
     preprocessor = Preprocessor(PROJECT_PATH)
     
-    # Resample to match atlas resolution (25um)
-    print("\nResampling microCT to 25um...")
-    current_res = 20  # microCT resolution in micrometers
-    target_res = 25   # Allen CCF resolution in micrometers
-    
-    microct_resampled = preprocessor.resample_image(
-        microct, 
-        current_res,
-        target_res
+    current_res = (
+        args.microct_spacing
+        if args.microct_spacing is not None
+        else infer_spacing_um(microct_path) if microct_path is not None else None
     )
+    if current_res is None:
+        current_res = prompt_spacing_um()
+    target_res = args.atlas_spacing
+    moving_spacing_um = current_res
+
+    if args.resample_moving:
+        print(f"\nResampling microCT from {current_res:g}um "
+              f"to {target_res:g}um...")
+        microct_for_registration = preprocessor.resample_image(
+            microct,
+            current_res,
+            target_res
+        )
+        moving_spacing_um = target_res
+    else:
+        print(f"\nKeeping microCT at native {current_res:g}um spacing.")
+        print("Registration will use physical spacing instead of resampling.")
+        microct_for_registration = microct
     
     # Normalize intensity
     print("\nNormalizing intensity...")
     microct_normalized = preprocessor.normalize_intensity(
-        microct_resampled, 
+        microct_for_registration,
         method='percentile'
     )
     
@@ -1029,10 +1422,44 @@ if __name__ == "__main__":
             atlas_normalized,
             moving_lm, 
             fixed_lm,
-            moving_spacing=(0.025, 0.025, 0.025),
-            fixed_spacing=(0.025, 0.025, 0.025),
+            moving_spacing=(moving_spacing_um / 1000.0,) * 3,
+            fixed_spacing=(target_res / 1000.0,) * 3,
             transform_type='affine'  # Options: 'affine', 'similarity', 'rigid'
         )
+
+        # Save the landmark transform immediately, before visualization windows
+        # or optional refinement can interrupt the run.
+        processed_dir = PROJECT_PATH / "data" / "processed"
+        processed_dir.mkdir(exist_ok=True, parents=True)
+        output_file = processed_dir / "microct_registered.tif"
+        transform_file = processed_dir / "transform_landmark.tfm"
+        metrics_file = processed_dir / "registration_metrics.json"
+
+        tifffile.imwrite(output_file, (registered * 65535).astype(np.uint16))
+        registrar.save_transform(transform, transform_file)
+
+        metrics_data = {
+            'mean_error_mm': float(metrics['mean_error']),
+            'std_error_mm': float(metrics['std_error']),
+            'max_error_mm': float(metrics['max_error']),
+            'min_error_mm': float(metrics['min_error']),
+            'num_landmarks': len(moving_lm),
+            'errors_per_landmark': [float(e) for e in metrics['errors']],
+            'coordinate_convention': 'Z, Y, X',
+            'moving_image': str(microct_path) if microct_path is not None else None,
+            'moving_shape_zyx': list(microct_normalized.shape),
+            'fixed_shape_zyx': list(atlas_normalized.shape),
+            'moving_spacing_um': moving_spacing_um,
+            'fixed_spacing_um': target_res,
+            'transform_saved_direction': 'fixed-to-moving',
+            'landmark_file': str(landmark_file),
+        }
+        with open(metrics_file, 'w') as f:
+            json.dump(metrics_data, f, indent=2)
+
+        print(f"\n✓ Registered image saved to: {output_file}")
+        print(f"✓ Transform saved to: {transform_file}")
+        print(f"✓ Metrics saved to: {metrics_file}")
         
         # Visualize results
         registrar.visualize_registration(
@@ -1056,8 +1483,8 @@ if __name__ == "__main__":
                 microct_normalized,
                 atlas_normalized,
                 transform,
-                moving_spacing=(0.025, 0.025, 0.025),
-                fixed_spacing=(0.025, 0.025, 0.025),
+                moving_spacing=(moving_spacing_um / 1000.0,) * 3,
+                fixed_spacing=(target_res / 1000.0,) * 3,
                 iterations=200
             )
             
@@ -1088,31 +1515,6 @@ if __name__ == "__main__":
         else:
             refined = registered
             refined_transform = transform
-        
-        # Save landmark-based results
-        output_file = PROJECT_PATH / "data" / "processed" / "microct_registered.tif"
-        output_file.parent.mkdir(exist_ok=True, parents=True)
-        tifffile.imwrite(output_file, (registered * 65535).astype(np.uint16))
-        print(f"\n✓ Registered image saved to: {output_file}")
-        
-        # Save transform
-        transform_file = PROJECT_PATH / "data" / "processed" / "transform_landmark.tfm"
-        registrar.save_transform(transform, transform_file)
-        
-        # Save metrics
-        metrics_file = PROJECT_PATH / "data" / "processed" / "registration_metrics.json"
-        metrics_data = {
-            'mean_error_mm': float(metrics['mean_error']),
-            'std_error_mm': float(metrics['std_error']),
-            'max_error_mm': float(metrics['max_error']),
-            'min_error_mm': float(metrics['min_error']),
-            'num_landmarks': len(moving_lm),
-            'errors_per_landmark': [float(e) for e in metrics['errors']],
-            'coordinate_convention': 'Z, Y, X'
-        }
-        with open(metrics_file, 'w') as f:
-            json.dump(metrics_data, f, indent=2)
-        print(f"✓ Metrics saved to: {metrics_file}")
         
         print("\n" + "="*70)
         print("REGISTRATION COMPLETE")

@@ -97,12 +97,26 @@ C:\DATA\MFA\uCT\uCT2CCF\
 
 ### Allen CCF Data
 
-Allen CCF files can be downloaded automatically or manually:
+Allen CCF files are shared by the whole installation rather than copied into
+every animal/project folder. They are cached in:
+
+```text
+resources/allen_ccf/
+```
+
+The first run of `microprism_atlas_mapper.py` automatically downloads:
+
 - **Annotation volume** (annotation_25.nrrd): Brain region labels
-- **Template volume** (average_template_25.nrrd): MRI-like reference image
+- **Average template** (average_template_25.nrrd): Anatomical intensity image
 - **Structure tree** (structure_tree.json): Region hierarchy and names
 
-Download URL: http://download.alleninstitute.org/informatics-archive/current-release/mouse_ccf/
+They can also be prepared in advance:
+
+```bash
+python src/allen_ccf_resources.py
+```
+
+Once downloaded, the same files are reused for all datasets.
 
 ---
 
@@ -116,6 +130,8 @@ Download URL: http://download.alleninstitute.org/informatics-archive/current-rel
 | `midline_alignment.py` | Align brain midline | Interactive marking, axis verification |
 | `landmark_registration.py` | Register to CCF | Landmark selection, affine transform, refinement |
 | `fiber_tracker.py` | Track optical fibers | Manual tracking, CCF region lookup |
+| `microprism_corner_tracker.py` | Track a microprism face | Four-corner marking and imaging-face derivation |
+| `microprism_atlas_mapper.py` | Map a microprism face to CCF | Full-plane region sampling and labeled atlas map |
 | `fiber_visualizer_3d.py` | 3D visualization | Interactive 3D view, slice planes |
 | `movie_creator.py` | Create MP4 movies | GUI-based, multiple axes |
 | `annotation_loader.py` | View CCF annotations | Interactive browser, structure colors |
@@ -329,6 +345,53 @@ python fiber_tracker.py
 - `fiber_ccf_overlay.png`: CCF overlay
 
 **Time**: 5-10 minutes per fiber
+
+---
+
+### Microprism Imaging-Plane Mapping
+
+Run the corner tracker first, then map the saved imaging face into the Allen
+CCF annotation:
+
+```bash
+python src/microprism_corner_tracker.py /path/to/project
+python src/microprism_atlas_mapper.py /path/to/project
+```
+
+If the microCT voxel dimensions differ by axis, pass the exact physical pixel
+sizes in millimeters when tracking:
+
+```bash
+python src/microprism_corner_tracker.py /path/to/project \
+  --spacing-x 0.020 --spacing-y 0.020 --spacing-z 0.025
+```
+
+Those values are saved in `microprism_corners.json` and reused by the mapper.
+They can also be overridden at mapping time with `--source-spacing-x`,
+`--source-spacing-y`, and `--source-spacing-z`.
+
+The mapper automatically looks for:
+
+- `outputs/microprism_corners.json`
+- `data/ccf/annotation_25.nrrd`
+- `data/ccf/structure_tree.json`
+- `data/processed/transform_landmark.tfm` when the tracked image is unregistered
+
+Paths can also be supplied explicitly with `--corners`, `--annotation`,
+`--ontology`, and `--transform`. The output displays the complete corresponding
+oblique atlas plane in an upright prism-aligned view, outlines the actual prism
+face, labels the region at each corner, and saves CSV and JSON region summaries.
+The face is rectified to a true rectangle using the prism width/length ratio
+entered in the tracker, so affine registration skew is not shown as physical
+prism tilt.
+The interactive viewer starts centered on the prism. Scroll or use `+`/`-` to
+zoom. Use `In-plane`, `Coronal`, `Sagittal`, and `Axial` to switch perspectives.
+Click-drag the image, use the arrow controls, or press the arrow keys to pan.
+Choose `Full` (or press `F`) for the complete current slice, and press `R` to
+reset its zoom. The Allen average anatomical template is displayed beneath
+translucent annotation colors and region boundaries. Use `--no-template` for
+the label-only view. The full calculation is documented in
+`docs/microprism_atlas_mapping.md`.
 
 ---
 
@@ -550,6 +613,9 @@ python annotation_loader.py
 | `fiber_summary.txt` | `.txt` | Human-readable fiber summary |
 | `fiber_horizontal_view.png` | `.png` | Fiber overview visualization |
 | `fiber_ccf_overlay.png` | `.png` | CCF overlay visualization |
+| `microprism_atlas_plane.png` | `.png` | Labeled CCF region map across the imaging face |
+| `microprism_atlas_regions.csv` | `.csv` | Region coverage percentages for the imaging face |
+| `microprism_atlas_regions.json` | `.json` | CCF corners, mapping settings, and region summary |
 | `*_movie.mp4` | `.mp4` | Slice movies |
 | `coronal_overlay_*.png` | `.png` | Registration overlay images |
 
@@ -620,4 +686,3 @@ For questions or issues:
 4. Check that all dependencies are installed
 
 ---
-
