@@ -46,9 +46,123 @@ PRISM_OVERLAY_COLOR = "#ff3030"
 PRISM_FILL_COLOR = (1.0, 0.1, 0.1, 0.18)
 PRISM_MARKER_COLOR = "#ff5a5a"
 TWO_PHOTON_OVERLAY_ALPHA = 0.65
-TWO_PHOTON_BUTTON_COLOR = "#f4a742"
-TWO_PHOTON_BUTTON_HOVER_COLOR = "#ffc56e"
+TWO_PHOTON_ZOOM_OVERLAY_ALPHA = 1.0
+TWO_PHOTON_ZOOM_ALIGN_ALPHA = 0.55
+
+# --- interface design tokens -------------------------------------------
+# One palette and two font sizes, so every control is built the same way.
+UI_BG = "#14161a"
+UI_PANEL = "#1d222a"
+UI_BANNER = "#242a33"
+UI_SURFACE = "#2a2f38"
+UI_SURFACE_HOVER = "#3a414d"
+UI_ACTIVE = "#2f5a9e"
+UI_ACTIVE_HOVER = "#3a6cbb"
+UI_BORDER = "#454c59"
+UI_TEXT = "#e6e9ef"
+UI_TEXT_DARK = "#101216"
+UI_MUTED = "#8b93a1"
+UI_ACCENT_VIEW = "#5b9dff"
+UI_FONT_SMALL = 8.6
+UI_FONT_BODY = 10.0
+TWO_PHOTON_BUTTON_COLOR = "#f0a84b"
+TWO_PHOTON_BUTTON_HOVER_COLOR = "#ffc072"
 TWO_PHOTON_MARKER_COLOR = "#00d5ff"
+TWO_PHOTON_ZOOM_BUTTON_COLOR = "#5ecb8b"
+TWO_PHOTON_ZOOM_BUTTON_HOVER_COLOR = "#8fe0b0"
+TWO_PHOTON_ZOOM_OUTLINE_COLOR = "#5ecb8b"
+UI_BUTTON_KINDS = {
+    "default": (UI_SURFACE, UI_SURFACE_HOVER, UI_TEXT),
+    "active": (UI_ACTIVE, UI_ACTIVE_HOVER, UI_TEXT),
+    "twop": (
+        TWO_PHOTON_BUTTON_COLOR, TWO_PHOTON_BUTTON_HOVER_COLOR,
+        UI_TEXT_DARK,
+    ),
+    "zoom": (
+        TWO_PHOTON_ZOOM_BUTTON_COLOR, TWO_PHOTON_ZOOM_BUTTON_HOVER_COLOR,
+        UI_TEXT_DARK,
+    ),
+}
+DEFAULT_ZOOM_MAGNIFICATION = 2.0
+MAX_TWO_PHOTON_RENDER_PX = 2048
+CONTROLS_HELP = (
+    "Viewer controls\n"
+    "  Views      In-plane/I, Coronal/C, Sagittal/S, Axial/A\n"
+    "  Finish     press Q, or close the window; the summary then prints\n"
+    "  Toggles    Colors, Labels and Fill light up blue when on; Fill is\n"
+    "             the translucent red tint inside the prism outline\n"
+    "  Navigate   drag or arrows to pan, scroll or +/- to zoom, "
+    "0 fits the slice, R resets\n"
+    "  Display    G atlas colours, L corner labels, F prism fill, "
+    "Panel hides the region list\n"
+    "  2p         Map 2p loads the unzoomed then the zoomed image; "
+    "Layers shows the overlay toggles and opacity sliders\n"
+    "  Aligning   Check scores the match against the image data and "
+    "names a better offset if one exists\n"
+    "             drag or arrows (Shift = 10 px), Mag changes the "
+    "magnification, Enter confirms, R re-centres, Escape cancels\n"
+    "  Corners    click D1, D2, P1, P2; Z undoes, P pans\n"
+    "  MicroCT    uCT compares against the source volume; "
+    "scroll the panel to change slice"
+)
+
+
+def style_button(button: Button, kind: str) -> None:
+    """Re-skin an existing button, used to mark the active view."""
+    face, hover, text_colour = UI_BUTTON_KINDS[kind]
+    button.ax.set_facecolor(face)
+    button.color = face
+    button.hovercolor = hover
+    button.label.set_color(text_colour)
+    button.label.set_fontweight("bold" if kind != "default" else "normal")
+
+
+def make_button(
+    figure: Any,
+    rect: tuple[float, float, float, float],
+    label: str,
+    kind: str = "default",
+    fontsize: float = UI_FONT_SMALL,
+) -> Button:
+    """Build a toolbar button with the shared look.
+
+    Every control in the viewer goes through here, so colours, borders and
+    type sizes stay consistent instead of being respecified at each call site.
+    """
+    face, hover, text_colour = UI_BUTTON_KINDS[kind]
+    button_axis = figure.add_axes(list(rect))
+    button_axis.set_facecolor(face)
+    button = Button(button_axis, label, color=face, hovercolor=hover)
+    button.label.set_color(text_colour)
+    button.label.set_fontsize(fontsize)
+    button.label.set_fontweight("bold" if kind != "default" else "normal")
+    for spine in button_axis.spines.values():
+        spine.set_color(UI_BORDER)
+        spine.set_linewidth(0.8)
+    return button
+
+
+def make_slider(
+    figure: Any,
+    rect: tuple[float, float, float, float],
+    label: str,
+    valinit: float,
+    colour: str,
+) -> Slider:
+    """Build a 0..1 opacity slider with the shared look."""
+    slider_axis = figure.add_axes(list(rect))
+    slider = Slider(
+        slider_axis, label, 0.0, 1.0,
+        valinit=float(np.clip(valinit, 0.0, 1.0)), valstep=0.05, color=colour,
+    )
+    slider.label.set_position((0.0, 1.9))
+    slider.label.set_horizontalalignment("left")
+    slider.label.set_verticalalignment("bottom")
+    slider.label.set_color(UI_MUTED)
+    slider.label.set_fontsize(UI_FONT_SMALL - 0.6)
+    slider.valtext.set_color(UI_TEXT)
+    slider.valtext.set_fontsize(UI_FONT_SMALL - 0.6)
+    return slider
 
 
 def spacing_xyz(
@@ -660,9 +774,11 @@ def project_xyz_to_view_mm(
     if mode_name == "coronal":
         return np.array((x * sx, -y * sy), dtype=float)
     if mode_name == "sagittal":
-        return np.array((y * sy, -z * sz), dtype=float)
+        # anterior-posterior horizontal, dorsal up: the brain lies on its
+        # side rather than standing on end.
+        return np.array((z * sz, -y * sy), dtype=float)
     if mode_name == "axial":
-        return np.array((x * sx, -z * sz), dtype=float)
+        return np.array((z * sz, -x * sx), dtype=float)
     raise ValueError(f"Cannot project mode {mode_name!r}")
 
 
@@ -1028,15 +1144,21 @@ def describe_two_photon_image(image: np.ndarray) -> str:
     return f"shape={image.shape}, dtype={image.dtype}, mode={color_mode}, {value_range}"
 
 
-def choose_image_file_interactively() -> Path | None:
-    """Open a local image picker when possible; return None if canceled/unavailable."""
+def choose_image_file_interactively(
+    prompt: str = "Select 2p JPG/PNG image",
+) -> Path | None:
+    """Open a local image picker when possible; None if canceled/unavailable.
+
+    ``prompt`` titles the dialog so the unzoomed and zoomed images cannot be
+    confused with one another.
+    """
     if sys.platform == "darwin":
         try:
             completed = subprocess.run(
                 [
                     "osascript",
                     "-e",
-                    'POSIX path of (choose file with prompt "Select 2p JPG/PNG image" '
+                    f'POSIX path of (choose file with prompt "{prompt}" '
                     'of type {"public.jpeg", "public.png", "public.tiff", "public.image"})',
                 ],
                 check=False,
@@ -1062,7 +1184,7 @@ def choose_image_file_interactively() -> Path | None:
             root.withdraw()
             root.attributes("-topmost", True)
             selected = filedialog.askopenfilename(
-                title="Select 2p JPG/PNG image",
+                title=prompt,
                 filetypes=(
                     ("Image files", "*.jpg *.jpeg *.png *.tif *.tiff"),
                     ("All files", "*.*"),
@@ -1074,6 +1196,55 @@ def choose_image_file_interactively() -> Path | None:
         except Exception as error:
             print(f"Tk file picker unavailable, falling back: {error}")
     return None
+
+
+def ask_number_interactively(
+    question: str,
+    default: float,
+) -> float | None:
+    """Prompt for a positive number in a native dialog, else the terminal."""
+    if sys.platform == "darwin":
+        script = (
+            f'text returned of (display dialog "{question}" '
+            f'default answer "{default:g}" with title "2p Mapper")'
+        )
+        try:
+            completed = subprocess.run(
+                ["osascript", "-e", script],
+                check=False, capture_output=True, text=True,
+            )
+        except OSError as error:
+            print(f"macOS dialog unavailable: {error}")
+        else:
+            if completed.returncode != 0:
+                return None
+            typed = completed.stdout.strip()
+            if not typed:
+                return default
+            try:
+                value = float(typed)
+            except ValueError:
+                print(f"'{typed}' is not a number; using {default:g}.")
+                return default
+            if value <= 0.0 or not np.isfinite(value):
+                print(f"Magnification must be positive; using {default:g}.")
+                return default
+            return value
+
+    while True:
+        print(f"(answer in this terminal) {question} [{default:g}]")
+        typed = input("> ").strip()
+        if not typed:
+            return default
+        try:
+            value = float(typed)
+        except ValueError:
+            print("  Enter a number, for example 2 for 2x.")
+            continue
+        if value <= 0.0 or not np.isfinite(value):
+            print("  Magnification must be a positive, finite number.")
+            continue
+        return value
 
 
 def polygon_signed_area(points_xy: np.ndarray) -> float:
@@ -1123,17 +1294,22 @@ def apply_projective_transform(points_xy: np.ndarray, homography: np.ndarray) ->
     return mapped[..., :2] / np.where(np.abs(scale) > 1e-12, scale, np.nan)
 
 
-def warp_two_photon_to_plane(
+def warp_image_with_homography(
     image: np.ndarray,
-    source_points_xy: np.ndarray,
-    target_points_uv_mm: np.ndarray,
+    homography: np.ndarray,
     extent_uv_mm: tuple[float, float, float, float],
     output_shape: tuple[int, int],
     opacity: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Warp a 2p image into the in-plane atlas grid for display."""
+    clip_polygon_uv_mm: np.ndarray | None = None,
+) -> np.ndarray:
+    """Warp an image onto the in-plane grid using a precomputed homography.
+
+    The homography maps source image pixels to prism-plane millimetres. It may
+    be fitted from four corner pairs, as for the unzoomed 2p image, or composed
+    from other transforms, as for the zoomed 2p image, which is why this takes
+    the matrix itself rather than point correspondences.
+    """
     image = as_display_image(image)
-    homography = solve_projective_transform(source_points_xy, target_points_uv_mm)
     inverse = np.linalg.inv(homography)
     rows, columns = output_shape
     u_values = np.linspace(extent_uv_mm[0], extent_uv_mm[1], columns)
@@ -1143,15 +1319,18 @@ def warp_two_photon_to_plane(
     source_xy = apply_projective_transform(destination, inverse)
 
     height, width = image.shape[:2]
-    target_polygon = target_points_uv_mm[[0, 1, 3, 2]]
-    inside_target = MatplotlibPath(target_polygon).contains_points(
-        destination.reshape(-1, 2), radius=1e-9
-    ).reshape(rows, columns)
-    inside_source = (
+    valid = (
         (source_xy[..., 0] >= 0.0) & (source_xy[..., 0] <= width - 1)
         & (source_xy[..., 1] >= 0.0) & (source_xy[..., 1] <= height - 1)
+        & np.isfinite(source_xy).all(axis=-1)
     )
-    valid = inside_target & inside_source & np.isfinite(source_xy).all(axis=-1)
+    if clip_polygon_uv_mm is not None:
+        inside_target = MatplotlibPath(
+            np.asarray(clip_polygon_uv_mm, dtype=float)
+        ).contains_points(
+            destination.reshape(-1, 2), radius=1e-9
+        ).reshape(rows, columns)
+        valid = valid & inside_target
     warped = np.zeros((rows, columns, 4), dtype=float)
 
     try:
@@ -1173,7 +1352,180 @@ def warp_two_photon_to_plane(
 
     warped[..., :3] = sampled[..., :3]
     warped[..., 3] = np.where(valid, float(np.clip(opacity, 0.0, 1.0)), 0.0)
+    return warped
+
+
+def warp_two_photon_to_plane(
+    image: np.ndarray,
+    source_points_xy: np.ndarray,
+    target_points_uv_mm: np.ndarray,
+    extent_uv_mm: tuple[float, float, float, float],
+    output_shape: tuple[int, int],
+    opacity: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit a projective transform from four corner pairs, then warp with it."""
+    target_points_uv_mm = np.asarray(target_points_uv_mm, dtype=float)
+    homography = solve_projective_transform(source_points_xy, target_points_uv_mm)
+    inverse = np.linalg.inv(homography)
+    warped = warp_image_with_homography(
+        image, homography, extent_uv_mm, output_shape, opacity,
+        clip_polygon_uv_mm=target_points_uv_mm[[0, 1, 3, 2]],
+    )
     return warped, homography, inverse
+
+
+def score_zoom_alignment(
+    wide_image: np.ndarray,
+    zoom_image: np.ndarray,
+    magnification: float,
+    translation_wide_px: tuple[float, float],
+    search_px: int = 24,
+    coarse_pixels: int = 96,
+) -> dict[str, Any]:
+    """Grade a manual zoom alignment against the image data itself.
+
+    The zoomed image is a magnified view of part of the unzoomed image, so when
+    it is scaled down and placed correctly the two should show the same thing.
+    This shrinks the zoom to the size it occupies in the unzoomed image and
+    measures how well the two match, using Pearson correlation: +1 is a perfect
+    linear match, 0 is unrelated.
+
+    The same measurement is repeated over a grid of nearby offsets. If some
+    other offset scores clearly better than the one chosen by hand, the manual
+    placement is probably a few pixels out. Returns the user's score, the best
+    nearby offset and its score, and the shift between them.
+    """
+    wide = as_display_image(wide_image)[..., :3].mean(axis=-1)
+    zoom = as_display_image(zoom_image)[..., :3].mean(axis=-1)
+    wide_height, wide_width = wide.shape[:2]
+    zoom_height, zoom_width = zoom.shape[:2]
+    display_width, display_height = zoom_display_size_px(
+        magnification, (wide_height, wide_width)
+    )
+    translate_x, translate_y = (float(v) for v in translation_wide_px)
+
+    step = max(1.0, max(display_width, display_height) / float(coarse_pixels))
+    offsets_u = np.arange(0.0, max(display_width - 1.0, 1.0), step)
+    offsets_v = np.arange(0.0, max(display_height - 1.0, 1.0), step)
+    if offsets_u.size < 4 or offsets_v.size < 4:
+        return {"available": False, "reason": "zoom footprint too small to score"}
+
+    # matching sample positions inside the zoom itself
+    zoom_columns = np.clip(
+        np.rint(offsets_u / max(display_width - 1.0, 1e-9) * (zoom_width - 1)),
+        0, zoom_width - 1,
+    ).astype(int)
+    zoom_rows = np.clip(
+        np.rint(offsets_v / max(display_height - 1.0, 1e-9) * (zoom_height - 1)),
+        0, zoom_height - 1,
+    ).astype(int)
+    zoom_patch = zoom[np.ix_(zoom_rows, zoom_columns)]
+    zoom_centred = zoom_patch - zoom_patch.mean()
+    zoom_norm = float(np.sqrt((zoom_centred ** 2).sum()))
+    if zoom_norm <= 0.0:
+        return {"available": False, "reason": "zoomed image has no contrast"}
+
+    def correlation(shift_x: float, shift_y: float) -> float | None:
+        columns = np.rint(translate_x + shift_x + offsets_u).astype(int)
+        rows = np.rint(translate_y + shift_y + offsets_v).astype(int)
+        if (
+            columns.min() < 0 or columns.max() > wide_width - 1
+            or rows.min() < 0 or rows.max() > wide_height - 1
+        ):
+            return None
+        patch = wide[np.ix_(rows, columns)]
+        centred = patch - patch.mean()
+        norm = float(np.sqrt((centred ** 2).sum()))
+        if norm <= 0.0:
+            return None
+        return float((centred * zoom_centred).sum() / (norm * zoom_norm))
+
+    chosen = correlation(0.0, 0.0)
+    best_score, best_shift = chosen, (0.0, 0.0)
+    for shift_y in range(-search_px, search_px + 1):
+        for shift_x in range(-search_px, search_px + 1):
+            value = correlation(float(shift_x), float(shift_y))
+            if value is not None and (best_score is None or value > best_score):
+                best_score, best_shift = value, (float(shift_x), float(shift_y))
+
+    if chosen is None or best_score is None:
+        return {"available": False, "reason": "zoom falls outside the unzoomed image"}
+    distance = float(np.hypot(*best_shift))
+    return {
+        "available": True,
+        "correlation_at_chosen_offset": chosen,
+        "best_nearby_correlation": best_score,
+        "best_nearby_shift_px": {"x": best_shift[0], "y": best_shift[1]},
+        "shift_distance_px": distance,
+        "search_radius_px": int(search_px),
+        "samples": int(zoom_patch.size),
+        "suspicious": bool(distance > 2.0 and best_score - chosen > 0.02),
+    }
+
+
+def plane_render_grid(
+    footprint_uv_mm: np.ndarray,
+    source_shape: tuple[int, int],
+    render_scale: float = 1.0,
+    max_pixels: int = MAX_TWO_PHOTON_RENDER_PX,
+    padding_fraction: float = 0.01,
+) -> tuple[tuple[float, float, float, float], tuple[int, int], float]:
+    """Choose an output extent and grid size that preserve the source detail.
+
+    ``footprint_uv_mm`` holds the prism-plane millimetre positions of the source
+    image's four corners, ordered top-left, top-right, bottom-left,
+    bottom-right. The returned grid spans their bounding box at a pixel pitch
+    matched to the source image.
+
+    This exists because the atlas sampling grid is deliberately floored at one
+    annotation voxel (25 microns) per pixel, which is right for atlas labels
+    and badly wrong for a photograph: a 512-pixel 2p image covering a 1.5 mm
+    prism face would be crushed to roughly 60 pixels. The 2p layers are drawn
+    with their own extent, so they can be sampled finely without changing the
+    atlas arrays at all.
+
+    Returns the extent in millimetres, the (rows, columns) grid shape, and the
+    resulting pixel pitch in millimetres.
+    """
+    footprint = np.asarray(footprint_uv_mm, dtype=float)
+    if footprint.shape != (4, 2) or not np.isfinite(footprint).all():
+        raise ValueError("A render-grid footprint needs four finite corners.")
+    top_left, top_right, bottom_left, bottom_right = footprint
+    width_mm = 0.5 * (
+        float(np.linalg.norm(top_right - top_left))
+        + float(np.linalg.norm(bottom_right - bottom_left))
+    )
+    height_mm = 0.5 * (
+        float(np.linalg.norm(bottom_left - top_left))
+        + float(np.linalg.norm(bottom_right - top_right))
+    )
+    source_height, source_width = int(source_shape[0]), int(source_shape[1])
+
+    pitches = []
+    if source_width > 1 and width_mm > 0.0:
+        pitches.append(width_mm / (source_width - 1))
+    if source_height > 1 and height_mm > 0.0:
+        pitches.append(height_mm / (source_height - 1))
+    if not pitches:
+        raise ValueError("Cannot size a render grid for a degenerate footprint.")
+    pitch = min(pitches) / max(float(render_scale), 1e-6)
+
+    minimum = footprint.min(axis=0)
+    maximum = footprint.max(axis=0)
+    padding = np.maximum((maximum - minimum) * padding_fraction, pitch)
+    minimum = minimum - padding
+    maximum = maximum + padding
+    span = maximum - minimum
+
+    columns = int(np.clip(np.ceil(span[0] / pitch) + 1, 2, max_pixels))
+    rows = int(np.clip(np.ceil(span[1] / pitch) + 1, 2, max_pixels))
+    # honour the cap by coarsening rather than cropping
+    pitch = max(span[0] / max(columns - 1, 1), span[1] / max(rows - 1, 1))
+    extent = (
+        float(minimum[0]), float(maximum[0]),
+        float(minimum[1]), float(maximum[1]),
+    )
+    return extent, (rows, columns), float(pitch)
 
 
 def print_two_photon_mapping_diagnostics(
@@ -1211,6 +1563,123 @@ def print_two_photon_mapping_diagnostics(
             f"({actual[0]:8.4f}, {actual[1]:8.4f}) vs "
             f"({target[0]:8.4f}, {target[1]:8.4f}); error={error:.6f} mm"
         )
+
+
+def zoom_to_wide_matrix(
+    magnification: float,
+    translation_wide_px: tuple[float, float],
+    zoom_shape: tuple[int, int],
+    wide_shape: tuple[int, int],
+) -> np.ndarray:
+    """Return the 3x3 mapping zoomed 2p pixels onto unzoomed (wide) 2p pixels.
+
+    The zoomed image is acquired at ``magnification`` times the wide image's
+    magnification, so its field of view spans ``wide_width / magnification``
+    wide pixels regardless of how many pixels the zoom itself was sampled at.
+    Scale and translation only: both frames share a scan angle, so there is no
+    rotation term.
+
+    Coordinates are 0-based, origin at the top-left, y increasing downward,
+    matching numpy and Matplotlib's image convention.
+    """
+    magnification = float(magnification)
+    if not np.isfinite(magnification) or magnification <= 0.0:
+        raise ValueError("2p magnification must be a positive, finite number.")
+    zoom_height, zoom_width = int(zoom_shape[0]), int(zoom_shape[1])
+    wide_height, wide_width = int(wide_shape[0]), int(wide_shape[1])
+    if min(zoom_height, zoom_width, wide_height, wide_width) < 2:
+        raise ValueError("2p images must be at least 2x2 pixels.")
+    scale_x = (wide_width / magnification) / zoom_width
+    scale_y = (wide_height / magnification) / zoom_height
+    translate_x, translate_y = (float(value) for value in translation_wide_px)
+    return np.array([
+        [scale_x, 0.0, translate_x],
+        [0.0, scale_y, translate_y],
+        [0.0, 0.0, 1.0],
+    ], dtype=float)
+
+
+def zoom_display_size_px(
+    magnification: float,
+    wide_shape: tuple[int, int],
+) -> tuple[float, float]:
+    """Return (width, height) that the scaled zoom occupies in wide pixels."""
+    magnification = float(magnification)
+    if not np.isfinite(magnification) or magnification <= 0.0:
+        raise ValueError("2p magnification must be a positive, finite number.")
+    wide_height, wide_width = int(wide_shape[0]), int(wide_shape[1])
+    return wide_width / magnification, wide_height / magnification
+
+
+def compose_zoom_to_plane(
+    wide_to_plane: np.ndarray,
+    zoom_to_wide: np.ndarray,
+) -> np.ndarray:
+    """Chain zoom to wide to prism plane into a single matrix.
+
+    Matrix multiplication is transform chaining, so one matrix multiply
+    replaces running a point through two separate steps.
+    """
+    return (
+        np.asarray(wide_to_plane, dtype=float)
+        @ np.asarray(zoom_to_wide, dtype=float)
+    )
+
+
+def write_two_photon_alignment(
+    path: Path,
+    wide_image_path: Path | None,
+    zoom_image_path: Path | None,
+    magnification: float,
+    translation_wide_px: tuple[float, float],
+    zoom_shape: tuple[int, int],
+    wide_shape: tuple[int, int],
+    zoom_to_wide: np.ndarray,
+    wide_to_plane: np.ndarray | None = None,
+    zoom_to_plane: np.ndarray | None = None,
+    extra: dict[str, Any] | None = None,
+) -> Path:
+    """Persist the zoom alignment so it never has to be redone by hand."""
+    zoom_to_wide = np.asarray(zoom_to_wide, dtype=float)
+    translate_x, translate_y = (float(value) for value in translation_wide_px)
+    display_width, display_height = zoom_display_size_px(magnification, wide_shape)
+    payload: dict[str, Any] = {
+        "wide_image": str(wide_image_path) if wide_image_path else None,
+        "zoom_image": str(zoom_image_path) if zoom_image_path else None,
+        "magnification": float(magnification),
+        "scale_factor_x": float(zoom_to_wide[0, 0]),
+        "scale_factor_y": float(zoom_to_wide[1, 1]),
+        "wide_shape_rows_columns": [int(wide_shape[0]), int(wide_shape[1])],
+        "zoom_shape_rows_columns": [int(zoom_shape[0]), int(zoom_shape[1])],
+        "zoom_display_size_wide_px": [display_width, display_height],
+        "translation_wide_px_0based": {"x": translate_x, "y": translate_y},
+        "translation_wide_px_1based": {
+            "x": translate_x + 1.0,
+            "y": translate_y + 1.0,
+        },
+        "zoom_to_wide_matrix": zoom_to_wide.tolist(),
+        "coordinate_convention": (
+            "Matrices operate on 0-based pixel coordinates with the origin at "
+            "the top-left of the image and y increasing downward. Translation "
+            "is the wide-image pixel coordinate of the scaled zoom's top-left "
+            "corner. The *_1based fields repeat it in the 1..N convention used "
+            "by ImageJ and MATLAB."
+        ),
+        "transform_chain": (
+            "zoom px -> wide px (scale + translate) -> prism-plane mm "
+            "(projective) -> Allen CCF XYZ voxels (PlaneGeometry.uv_to_xyz)"
+        ),
+    }
+    if wide_to_plane is not None:
+        payload["wide_to_plane_mm_matrix"] = np.asarray(wide_to_plane).tolist()
+    if zoom_to_plane is not None:
+        payload["zoom_to_plane_mm_matrix"] = np.asarray(zoom_to_plane).tolist()
+    if extra:
+        payload.update(extra)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2)
+    return path
 
 
 def annotation_id_at_point(annotation: np.ndarray, point_xyz: np.ndarray) -> int:
@@ -1359,6 +1828,10 @@ def render_plane_map(
     zoom_context_mm: float,
     two_photon_image_path: Path | None = None,
     two_photon_opacity: float = TWO_PHOTON_OVERLAY_ALPHA,
+    two_photon_zoom_image_path: Path | None = None,
+    two_photon_magnification: float | None = None,
+    two_photon_zoom_opacity: float = TWO_PHOTON_ZOOM_OVERLAY_ALPHA,
+    two_photon_render_scale: float = 1.0,
 ) -> None:
     face_order = ("bottom_left", "bottom_right", "top_right", "top_left")
     corner_by_key = {row["corner_key"]: row for row in corner_rows}
@@ -1385,6 +1858,12 @@ def render_plane_map(
     two_photon_output_path = output_path.with_name(
         f"{output_path.stem}_2p_overlay{output_path.suffix}"
     )
+    two_photon_alignment_path = output_path.with_name(
+        f"{output_path.stem}_2p_alignment.json"
+    )
+    two_photon_alignment_visual_path = output_path.with_name(
+        f"{output_path.stem}_2p_alignment{output_path.suffix}"
+    )
 
     center_xyz = geometry.origin_xyz
     nz, ny, nx = annotation.shape
@@ -1400,7 +1879,7 @@ def render_plane_map(
         for key, point in display_corners_ccf.items()
     }
     axial_points = {
-        key: np.array((point[0], -point[2])) * atlas_spacing_mm
+        key: project_xyz_to_view_mm(point, "axial", atlas_spacing_xyz_mm)
         for key, point in display_corners_ccf.items()
     }
 
@@ -1431,14 +1910,14 @@ def render_plane_map(
             "slice_index": coronal_index,
         },
         "sagittal": {
-            "labels": annotation[:, :, sagittal_index],
+            "labels": annotation[:, :, sagittal_index].T,
             "template": (
-                template[:, :, sagittal_index]
+                template[:, :, sagittal_index].T
                 if template is not None else None
             ),
             "extent": (
-                0.0, (ny - 1) * atlas_spacing_mm,
-                -(nz - 1) * atlas_spacing_mm, 0.0,
+                0.0, (nz - 1) * atlas_spacing_mm,
+                -(ny - 1) * atlas_spacing_mm, 0.0,
             ),
             "origin": "upper",
             "points": sagittal_points,
@@ -1447,13 +1926,14 @@ def render_plane_map(
             "slice_index": sagittal_index,
         },
         "axial": {
-            "labels": annotation[:, axial_index, :],
+            "labels": annotation[:, axial_index, :].T,
             "template": (
-                template[:, axial_index, :] if template is not None else None
+                template[:, axial_index, :].T
+                if template is not None else None
             ),
             "extent": (
-                0.0, (nx - 1) * atlas_spacing_mm,
-                -(nz - 1) * atlas_spacing_mm, 0.0,
+                0.0, (nz - 1) * atlas_spacing_mm,
+                -(nx - 1) * atlas_spacing_mm, 0.0,
             ),
             "origin": "upper",
             "points": axial_points,
@@ -1477,13 +1957,34 @@ def render_plane_map(
             "axial": int(np.clip(round(source_center_xyz[1]), 0, microct_ny - 1)),
         }
 
-    figure, axis = plt.subplots(figsize=(14.2, 8.2), facecolor="black")
-    figure.subplots_adjust(left=0, right=0.69, top=0.94, bottom=0.11)
-    microct_axis = figure.add_axes([0.50, 0.15, 0.25, 0.78])
+    figure, axis = plt.subplots(figsize=(14.2, 8.2), facecolor=UI_BG)
+    figure.subplots_adjust(left=0.006, right=0.771, top=0.936, bottom=0.078)
+    microct_axis = figure.add_axes([0.487, 0.078, 0.24, 0.852])
     microct_axis.set_visible(False)
-    microct_axis.set_facecolor("black")
-    panel_axis = figure.add_axes([0.705, 0.11, 0.285, 0.83])
-    panel_axis.set_facecolor("black")
+    microct_axis.set_facecolor(UI_BG)
+    panel_axis = figure.add_axes([0.781, 0.078, 0.209, 0.852])
+    panel_axis.set_facecolor(UI_PANEL)
+    banner_axis = figure.add_axes([0.006, 0.942, 0.984, 0.046])
+    banner_axis.set_facecolor(UI_BANNER)
+    banner_axis.set_xticks([])
+    banner_axis.set_yticks([])
+    for _spine in banner_axis.spines.values():
+        _spine.set_color(UI_ACCENT_VIEW)
+        _spine.set_linewidth(1.1)
+    banner_steps = banner_axis.text(
+        0.007, 0.5, "", ha="left", va="center", color=UI_ACCENT_VIEW,
+        fontsize=UI_FONT_SMALL, fontweight="bold",
+        transform=banner_axis.transAxes,
+    )
+    banner_message = banner_axis.text(
+        0.052, 0.5, "", ha="left", va="center", color=UI_TEXT,
+        fontsize=UI_FONT_BODY - 0.6, transform=banner_axis.transAxes,
+    )
+    banner_title = banner_axis.text(
+        0.994, 0.5, "", ha="right", va="center", color=UI_MUTED,
+        fontsize=UI_FONT_SMALL, fontweight="bold",
+        transform=banner_axis.transAxes,
+    )
     state: dict[str, Any] = {
         "mode": "in_plane",
         "compare_microct": False,
@@ -1501,6 +2002,28 @@ def render_plane_map(
         "two_photon_selection_points": [],
         "two_photon_selection_bounds": None,
         "two_photon_pan": False,
+        "two_photon_zoom_image_path": two_photon_zoom_image_path,
+        "two_photon_zoom_image": None,
+        "two_photon_magnification": (
+            float(two_photon_magnification)
+            if two_photon_magnification else DEFAULT_ZOOM_MAGNIFICATION
+        ),
+        "two_photon_zoom_translation": (0.0, 0.0),
+        "two_photon_zoom_alpha": float(
+            np.clip(two_photon_zoom_opacity, 0.0, 1.0)
+        ),
+        "two_photon_zoom_to_wide": None,
+        "two_photon_zoom_homography": None,
+        "two_photon_zoom_warped_rgba": None,
+        "two_photon_warped_extent": None,
+        "two_photon_zoom_warped_extent": None,
+        "two_photon_render_scale": max(float(two_photon_render_scale), 0.05),
+        "context_group": None,
+        "show_region_panel": True,
+        "show_two_photon_zoom": True,
+        "two_photon_aligning": False,
+        "two_photon_align_bounds": None,
+        "two_photon_align_drag": None,
         "bounds": {},
         "microct_bounds": {},
         "microct_pan": False,
@@ -1601,16 +2124,47 @@ def render_plane_map(
         )
 
     def apply_viewer_layout() -> None:
-        if comparison_active():
-            axis.set_position([0.02, 0.14, 0.46, 0.80])
-            microct_axis.set_position([0.50, 0.14, 0.24, 0.80])
-            panel_axis.set_position([0.755, 0.14, 0.235, 0.80])
+        """Position the axes for the current mode.
+
+        The main view grows when the contextual button row is hidden and
+        when the region panel is collapsed, so screen space follows what is
+        actually on show.
+        """
+        bottom = 0.136 if state.get("context_group") else 0.078
+        top = 0.936
+        height = top - bottom
+        comparing = comparison_active()
+        panel_open = bool(state.get("show_region_panel", True)) or comparing
+        if comparing:
+            axis.set_position([0.022, bottom, 0.45, height])
+            microct_axis.set_position([0.487, bottom, 0.24, height])
             microct_axis.set_visible(True)
+            panel_axis.set_position([0.742, bottom, 0.248, height])
         else:
-            axis.set_position([0.0, 0.14, 0.69, 0.80])
-            panel_axis.set_position([0.705, 0.14, 0.285, 0.80])
+            main_width = 0.765 if panel_open else 0.984
+            axis.set_position([0.006, bottom, main_width, height])
+            panel_axis.set_position([0.781, bottom, 0.209, height])
             microct_axis.clear()
             microct_axis.set_visible(False)
+        panel_axis.set_visible(panel_open)
+
+    context_widgets: dict[str, list[Any]] = {
+        "align": [], "corners": [], "uct": [], "layers": [],
+    }
+
+    def set_context_group(name: str | None) -> None:
+        """Show one contextual button row at a time, or none at all."""
+        state["context_group"] = name
+        for group, widgets in context_widgets.items():
+            visible = group == name
+            for widget in widgets:
+                widget.ax.set_visible(visible)
+                # Invisible widgets still receive events unless deactivated,
+                # which let stacked sliders fight over the mouse grab and
+                # let hidden buttons fire on clicks inside the atlas view.
+                widget.set_active(visible)
+        apply_viewer_layout()
+        figure.canvas.draw_idle()
 
     def microct_display(mode_name: str) -> dict[str, Any]:
         if microct_image is None:
@@ -1629,8 +2183,8 @@ def render_plane_map(
             max_slice = nz_m - 1
             label = "Coronal microCT"
         elif mode_name == "sagittal":
-            image_slice = microct_image[:, :, slice_index]
-            extent = (0.0, (ny_m - 1) * sy, -(nz_m - 1) * sz, 0.0)
+            image_slice = microct_image[:, :, slice_index].T
+            extent = (0.0, (nz_m - 1) * sz, -(ny_m - 1) * sy, 0.0)
             points = {
                 key: project_xyz_to_view_mm(point, mode_name, source_spacing_xyz_mm)
                 for key, point in corners_source.items()
@@ -1639,8 +2193,8 @@ def render_plane_map(
             max_slice = nx_m - 1
             label = "Sagittal microCT"
         else:
-            image_slice = microct_image[:, slice_index, :]
-            extent = (0.0, (nx_m - 1) * sx, -(nz_m - 1) * sz, 0.0)
+            image_slice = microct_image[:, slice_index, :].T
+            extent = (0.0, (nz_m - 1) * sz, -(nx_m - 1) * sx, 0.0)
             points = {
                 key: project_xyz_to_view_mm(point, mode_name, source_spacing_xyz_mm)
                 for key, point in corners_source.items()
@@ -1786,7 +2340,83 @@ def render_plane_map(
         draw_microct_comparison()
         figure.canvas.draw_idle()
 
+    def set_status(
+        message: str,
+        step: int | None = None,
+        tone: str = "info",
+        flush: bool = False,
+    ) -> None:
+        """Put the current instruction on screen, not only in the terminal.
+
+        ``flush`` forces a synchronous repaint, used before opening a modal
+        file dialog so the instruction is readable behind it.
+        """
+        tones = {
+            "info": UI_ACCENT_VIEW,
+            "twop": TWO_PHOTON_BUTTON_COLOR,
+            "zoom": TWO_PHOTON_ZOOM_BUTTON_COLOR,
+        }
+        colour = tones.get(tone, UI_ACCENT_VIEW)
+        banner_steps.set_text(
+            "" if step is None else "  ".join(
+                "\u25cf" if index == step else "\u25cb"
+                for index in (1, 2, 3)
+            )
+        )
+        banner_steps.set_color(colour)
+        banner_message.set_text(message)
+        for spine in banner_axis.spines.values():
+            spine.set_color(colour)
+        figure.canvas.draw_idle()
+        if flush:
+            try:
+                figure.canvas.draw()
+                figure.canvas.flush_events()
+            except Exception as error:
+                print(f"WARNING: banner repaint failed: {error}")
+
+    def fit_bounds_to_axes(
+        bounds: tuple[float, float, float, float],
+    ) -> tuple[float, float, float, float]:
+        """Widen bounds to the axes' own aspect ratio.
+
+        With equal aspect, a view whose data is squarer than its box gets
+        letterboxed with dead space either side. Expanding the short axis to
+        match the box means the slice fills the window instead.
+        """
+        position = axis.get_position()
+        figure_width, figure_height = figure.get_size_inches()
+        box_width = position.width * figure_width
+        box_height = position.height * figure_height
+        half_x = (bounds[1] - bounds[0]) / 2.0
+        half_y = (bounds[3] - bounds[2]) / 2.0
+        if min(box_width, box_height) <= 0 or not (half_x and half_y):
+            return bounds
+        box_aspect = box_width / box_height
+        if abs(half_x) / abs(half_y) < box_aspect:
+            half_x = np.sign(half_x) * abs(half_y) * box_aspect
+        else:
+            half_y = np.sign(half_y) * abs(half_x) / box_aspect
+        centre_x = (bounds[0] + bounds[1]) / 2.0
+        centre_y = (bounds[2] + bounds[3]) / 2.0
+        return (
+            float(centre_x - half_x), float(centre_x + half_x),
+            float(centre_y - half_y), float(centre_y + half_y),
+        )
+
+    def set_view_title(text: str, colour: str = UI_MUTED) -> None:
+        """Show the current view name in the banner.
+
+        An axes title would sit in the strip the banner occupies, so the two
+        overlapped; keeping it in the banner also returns that height to the
+        slice itself.
+        """
+        banner_title.set_text(text)
+        banner_title.set_color(colour)
+        figure.canvas.draw_idle()
+
     def set_view(bounds: tuple[float, float, float, float]) -> None:
+        bounds = fit_bounds_to_axes(bounds)
         axis.set_xlim(bounds[0], bounds[1])
         axis.set_ylim(bounds[2], bounds[3])
         if state["two_photon_selecting"]:
@@ -1803,6 +2433,223 @@ def render_plane_map(
             plt.pause(0.05)
         except Exception as error:
             print(f"WARNING: live viewer refresh failed: {error}")
+
+    def two_photon_zoom_extent_px() -> tuple[float, float, float, float]:
+        """Matplotlib imshow extent for the scaled zoom, in wide-image pixels."""
+        translate_x, translate_y = state["two_photon_zoom_translation"]
+        display_width, display_height = zoom_display_size_px(
+            state["two_photon_magnification"],
+            state["two_photon_image"].shape[:2],
+        )
+        return (
+            translate_x, translate_x + display_width,
+            translate_y + display_height, translate_y,
+        )
+
+    def current_zoom_to_wide() -> np.ndarray:
+        return zoom_to_wide_matrix(
+            state["two_photon_magnification"],
+            state["two_photon_zoom_translation"],
+            state["two_photon_zoom_image"].shape[:2],
+            state["two_photon_image"].shape[:2],
+        )
+
+    def center_two_photon_zoom() -> None:
+        wide_height, wide_width = state["two_photon_image"].shape[:2]
+        display_width, display_height = zoom_display_size_px(
+            state["two_photon_magnification"], (wide_height, wide_width)
+        )
+        state["two_photon_zoom_translation"] = (
+            (wide_width - display_width) / 2.0,
+            (wide_height - display_height) / 2.0,
+        )
+
+    def draw_two_photon_alignment_view(reset_view: bool = False) -> None:
+        wide_image = state["two_photon_image"]
+        zoom_image = state["two_photon_zoom_image"]
+        if wide_image is None or zoom_image is None:
+            print("2p alignment needs both an unzoomed and a zoomed image.")
+            return
+        height, width = wide_image.shape[:2]
+        state["compare_microct"] = False
+        apply_viewer_layout()
+        axis.clear()
+        axis.set_facecolor("black")
+        axis.imshow(wide_image, origin="upper", extent=(0.0, width, height, 0.0))
+        extent = two_photon_zoom_extent_px()
+        alpha = float(np.clip(state["two_photon_zoom_alpha"], 0.0, 1.0))
+        axis.imshow(
+            zoom_image, origin="upper", extent=extent, alpha=alpha,
+            zorder=5, interpolation="bilinear",
+        )
+        axis.add_patch(Rectangle(
+            (extent[0], extent[3]),
+            extent[1] - extent[0], extent[2] - extent[3],
+            facecolor="none", edgecolor=TWO_PHOTON_ZOOM_OUTLINE_COLOR,
+            linewidth=2.2, zorder=6,
+        ))
+        axis.set_aspect("equal", adjustable="box")
+        axis.axis("off")
+        if reset_view or state["two_photon_align_bounds"] is None:
+            axis.set_xlim(0.0, width)
+            axis.set_ylim(height, 0.0)
+            state["two_photon_align_bounds"] = (
+                0.0, float(width), float(height), 0.0
+            )
+        else:
+            bounds = state["two_photon_align_bounds"]
+            axis.set_xlim(bounds[0], bounds[1])
+            axis.set_ylim(bounds[2], bounds[3])
+        translate_x, translate_y = state["two_photon_zoom_translation"]
+        axis.set_title("")
+        set_view_title(
+            f"{state['two_photon_magnification']:g}x  \u00b7  top-left "
+            f"({translate_x:.1f}, {translate_y:.1f}) px  \u00b7  "
+            f"alpha {alpha:.2f}",
+            TWO_PHOTON_ZOOM_OUTLINE_COLOR,
+        )
+        figure.canvas.draw_idle()
+
+    def nudge_two_photon_zoom(delta_x: float, delta_y: float) -> None:
+        translate_x, translate_y = state["two_photon_zoom_translation"]
+        state["two_photon_zoom_translation"] = (
+            translate_x + float(delta_x), translate_y + float(delta_y),
+        )
+        draw_two_photon_alignment_view(reset_view=False)
+
+    def reset_two_photon_alignment() -> None:
+        center_two_photon_zoom()
+        draw_two_photon_alignment_view(reset_view=True)
+
+    def cancel_two_photon_alignment() -> None:
+        state["two_photon_aligning"] = False
+        state["two_photon_zoom_image"] = None
+        state["two_photon_align_drag"] = None
+        state["two_photon_align_bounds"] = None
+        print("2p zoom alignment canceled; the zoomed image was discarded.")
+        set_context_group(None)
+        set_status("Ready. Map 2p starts the two-photon overlay.", None, "info")
+        draw_mode(state["mode"])
+
+    def save_two_photon_alignment_visual() -> None:
+        try:
+            figure.savefig(
+                two_photon_alignment_visual_path, dpi=260,
+                facecolor=figure.get_facecolor(),
+                bbox_inches="tight", pad_inches=0.02,
+            )
+            print(
+                "Saved 2p zoom alignment QC visual: "
+                f"{two_photon_alignment_visual_path}"
+            )
+        except (OSError, ValueError) as error:
+            print(f"WARNING: could not save 2p alignment visual: {error}")
+
+    def start_two_photon_corner_selection() -> None:
+        set_context_group("corners")
+        set_status(
+            "Step 3 of 3  \u2014  click the four corners of the UNZOOMED "
+            "image along the black border: D1 top-left, D2 top-right, "
+            "P1 bottom-left, P2 bottom-right", 3, "twop",
+        )
+        state["two_photon_selecting"] = True
+        state["two_photon_selection_points"] = []
+        state["two_photon_selection_bounds"] = None
+        state["two_photon_pan"] = False
+        state["drag_start"] = None
+        state["drag_limits"] = None
+        print(
+            "\n2p corner selection is now active in the main atlas window. "
+            "Click the corners of the UNZOOMED image in order: D1/top-left, "
+            "D2/top-right, P1/bottom-left, P2/bottom-right, along the black "
+            "border where the band of emptiness appears. The overlay is "
+            "generated automatically after the fourth click."
+        )
+        draw_two_photon_selection_view(reset_view=True)
+        refresh_live_view()
+
+    def report_zoom_alignment_quality() -> dict[str, Any]:
+        """Score the current alignment and say plainly whether it looks right."""
+        try:
+            quality = score_zoom_alignment(
+                state["two_photon_image"],
+                state["two_photon_zoom_image"],
+                state["two_photon_magnification"],
+                state["two_photon_zoom_translation"],
+            )
+        except (ValueError, IndexError) as error:
+            print(f"WARNING: could not score the zoom alignment: {error}")
+            return {"available": False, "reason": str(error)}
+        if not quality.get("available"):
+            print(f"Alignment check skipped: {quality.get('reason')}")
+            set_view_title("alignment check unavailable", UI_MUTED)
+            return quality
+        chosen = quality["correlation_at_chosen_offset"]
+        best = quality["best_nearby_correlation"]
+        shift = quality["best_nearby_shift_px"]
+        print(
+            "\nAlignment check (image match, 1.0 is perfect):\n"
+            f"  your offset:      r = {chosen:+.4f}\n"
+            f"  best within {quality['search_radius_px']} px: "
+            f"r = {best:+.4f} at dx={shift['x']:+.0f}, dy={shift['y']:+.0f}"
+        )
+        if quality["suspicious"]:
+            print(
+                "  WARNING: a nearby offset matches noticeably better. "
+                "Consider nudging by that amount and checking again."
+            )
+            set_view_title(
+                f"match r={chosen:+.3f}  \u00b7  better by "
+                f"({shift['x']:+.0f}, {shift['y']:+.0f}) at r={best:+.3f}",
+                TWO_PHOTON_BUTTON_COLOR,
+            )
+        else:
+            print("  Looks consistent: no better offset found nearby.")
+            set_view_title(
+                f"match r={chosen:+.3f}  \u00b7  no better offset nearby",
+                TWO_PHOTON_ZOOM_OUTLINE_COLOR,
+            )
+        return quality
+
+    def complete_two_photon_alignment() -> None:
+        if not state["two_photon_aligning"]:
+            return
+        zoom_to_wide = current_zoom_to_wide()
+        state["two_photon_zoom_to_wide"] = zoom_to_wide
+        translate_x, translate_y = state["two_photon_zoom_translation"]
+        print(
+            "\n2p zoom alignment recorded:\n"
+            f"  magnification: {state['two_photon_magnification']:g}x\n"
+            f"  scale factor:  {zoom_to_wide[0, 0]:.6f} (x), "
+            f"{zoom_to_wide[1, 1]:.6f} (y)\n"
+            f"  translation:   x={translate_x:.3f}, y={translate_y:.3f} "
+            "unzoomed px, 0-based, top-left corner of the scaled zoom"
+        )
+        quality = report_zoom_alignment_quality()
+        save_two_photon_alignment_visual()
+        try:
+            write_two_photon_alignment(
+                two_photon_alignment_path,
+                state["two_photon_image_path"],
+                state["two_photon_zoom_image_path"],
+                state["two_photon_magnification"],
+                (translate_x, translate_y),
+                state["two_photon_zoom_image"].shape[:2],
+                state["two_photon_image"].shape[:2],
+                zoom_to_wide,
+                extra={"alignment_quality": quality},
+            )
+            print(f"Saved 2p alignment parameters: {two_photon_alignment_path}")
+        except OSError as error:
+            print(f"WARNING: could not save 2p alignment parameters: {error}")
+        state["two_photon_aligning"] = False
+        state["two_photon_align_drag"] = None
+        state["two_photon_zoom_alpha"] = 1.0
+        try:
+            zoom_alpha_slider.set_val(1.0)
+        except NameError:
+            pass
+        start_two_photon_corner_selection()
 
     def draw_two_photon_selection_view(reset_view: bool = False) -> None:
         image = state["two_photon_image"]
@@ -1843,7 +2690,8 @@ def render_plane_map(
         else:
             status = "2p corner selection complete | mapping to prism plane..."
         status += " | Pan on" if state["two_photon_pan"] else " | Pan off"
-        axis.set_title(status, color=TWO_PHOTON_BUTTON_COLOR, fontsize=12, fontweight="bold", pad=8)
+        axis.set_title("")
+        set_view_title(status, TWO_PHOTON_BUTTON_COLOR)
 
         for index, (x_value, y_value) in enumerate(points):
             label = corner_steps[index]
@@ -1880,6 +2728,8 @@ def render_plane_map(
         state["two_photon_selection_bounds"] = None
         state["two_photon_pan"] = False
         print("2p corner selection canceled.")
+        set_context_group(None)
+        set_status("Ready. Map 2p starts the two-photon overlay.", None, "info")
         draw_mode(state["mode"])
 
     def undo_two_photon_selection() -> None:
@@ -1920,32 +2770,123 @@ def render_plane_map(
         print("Recorded all four 2p corners in order: D1, D2, P1, P2.")
         for label, point in zip(("D1", "D2", "P1", "P2"), source_points):
             print(f"  2p {label}: x={point[0]:.3f}, y={point[1]:.3f} px")
+        render_scale = state["two_photon_render_scale"]
+        face_polygon = two_photon_target_uv_mm[[0, 1, 3, 2]]
         try:
-            warped_rgba, homography, inverse = warp_two_photon_to_plane(
-                two_photon_image,
-                source_points,
+            homography = solve_projective_transform(
+                source_points, two_photon_target_uv_mm
+            )
+            inverse = np.linalg.inv(homography)
+            wide_extent, wide_shape, wide_pitch = plane_render_grid(
                 two_photon_target_uv_mm,
-                in_plane_extent,
-                labels.shape,
-                opacity=1.0,
+                two_photon_image.shape[:2],
+                render_scale,
+            )
+            warped_rgba = warp_image_with_homography(
+                two_photon_image, homography, wide_extent, wide_shape,
+                1.0, clip_polygon_uv_mm=face_polygon,
             )
         except (np.linalg.LinAlgError, ValueError) as error:
             print(f"Could not map 2p image onto prism plane: {error}")
             return
+        print(
+            f"Unzoomed 2p overlay rendered at {wide_shape[1]} x "
+            f"{wide_shape[0]} px, {wide_pitch * 1000.0:.2f} um/px "
+            f"(the atlas plane grid is {atlas_spacing_mm * 1000.0:.0f} "
+            "um/px)."
+        )
 
         state["two_photon_source_points"] = source_points
         state["two_photon_warped_rgba"] = warped_rgba
+        state["two_photon_warped_extent"] = wide_extent
         state["two_photon_homography"] = homography
         state["two_photon_inverse_homography"] = inverse
+        state["two_photon_zoom_warped_rgba"] = None
+        state["two_photon_zoom_homography"] = None
+        zoom_image = state["two_photon_zoom_image"]
+        zoom_to_wide = state["two_photon_zoom_to_wide"]
+        if zoom_image is not None and zoom_to_wide is not None:
+            try:
+                zoom_homography = compose_zoom_to_plane(
+                    homography, zoom_to_wide
+                )
+                zoom_height, zoom_width = zoom_image.shape[:2]
+                zoom_corners_px = np.array([
+                    [0.0, 0.0], [zoom_width - 1.0, 0.0],
+                    [0.0, zoom_height - 1.0],
+                    [zoom_width - 1.0, zoom_height - 1.0],
+                ], dtype=float)
+                zoom_footprint = apply_projective_transform(
+                    zoom_corners_px, zoom_homography
+                )
+                zoom_extent, zoom_shape, zoom_pitch = plane_render_grid(
+                    zoom_footprint, zoom_image.shape[:2], render_scale,
+                )
+                zoom_warped = warp_image_with_homography(
+                    zoom_image, zoom_homography, zoom_extent, zoom_shape,
+                    1.0, clip_polygon_uv_mm=face_polygon,
+                )
+            except (np.linalg.LinAlgError, ValueError) as error:
+                print(f"Could not map the zoomed 2p image: {error}")
+            else:
+                state["two_photon_zoom_warped_rgba"] = zoom_warped
+                state["two_photon_zoom_warped_extent"] = zoom_extent
+                print(
+                    f"Zoomed 2p overlay rendered at {zoom_shape[1]} x "
+                    f"{zoom_shape[0]} px, {zoom_pitch * 1000.0:.2f} um/px."
+                )
+                state["two_photon_zoom_homography"] = zoom_homography
+                state["show_two_photon_zoom"] = True
+                zoom_pixels = int(
+                    np.count_nonzero(zoom_warped[..., 3] > 0.0)
+                )
+                print(
+                    "Generated zoomed 2p overlay: visible pixels="
+                    f"{zoom_pixels}."
+                )
+                if zoom_pixels == 0:
+                    print(
+                        "WARNING: the zoomed overlay is empty. Check that "
+                        "the zoom was aligned inside the unzoomed image's "
+                        "prism quadrilateral."
+                    )
+                try:
+                    write_two_photon_alignment(
+                        two_photon_alignment_path,
+                        state["two_photon_image_path"],
+                        state["two_photon_zoom_image_path"],
+                        state["two_photon_magnification"],
+                        state["two_photon_zoom_translation"],
+                        zoom_image.shape[:2],
+                        state["two_photon_image"].shape[:2],
+                        zoom_to_wide,
+                        wide_to_plane=homography,
+                        zoom_to_plane=zoom_homography,
+                        extra={
+                            "wide_corner_points_px_0based":
+                                source_points.tolist(),
+                            "prism_face_corners_uv_mm":
+                                two_photon_target_uv_mm.tolist(),
+                            "atlas_spacing_mm": float(atlas_spacing_mm),
+                        },
+                    )
+                    print(
+                        "Updated 2p alignment parameters with both "
+                        f"transforms: {two_photon_alignment_path}"
+                    )
+                except OSError as error:
+                    print(
+                        "WARNING: could not update alignment "
+                        f"parameters: {error}"
+                    )
         state["show_two_photon"] = True
         state["show_prism_fill"] = False
         state["two_photon_selecting"] = False
         state["two_photon_selection_bounds"] = None
         state["two_photon_pan"] = False
         try:
-            two_photon_toggle_button.label.set_text("2p on")
-            fill_button.label.set_text("Fill off")
-            two_photon_pan_button.label.set_text("2p Pan off")
+            sync_toggle_buttons()
+            two_photon_pan_button.label.set_text("Pan off")
         except NameError:
             pass
 
@@ -1965,6 +2906,12 @@ def render_plane_map(
         print_two_photon_mapping_diagnostics(
             source_points, two_photon_target_uv_mm, homography
         )
+        set_context_group(None)
+        set_status(
+            "2p overlay mapped onto the prism plane. "
+            "Layers shows the visibility toggles and opacity sliders.",
+            None, "info",
+        )
         save_two_photon_overlay_visual()
         refresh_live_view()
 
@@ -1981,6 +2928,11 @@ def render_plane_map(
         two_photon_visible = (
             mode_name == "in_plane" and state["show_two_photon"]
             and state["two_photon_warped_rgba"] is not None
+        )
+        two_photon_zoom_visible = (
+            mode_name == "in_plane" and state["show_two_photon"]
+            and state["show_two_photon_zoom"]
+            and state["two_photon_zoom_warped_rgba"] is not None
         )
 
         axis.clear()
@@ -2033,8 +2985,19 @@ def render_plane_map(
             overlay_rgba = np.array(state["two_photon_warped_rgba"], copy=True)
             overlay_rgba[..., 3] *= float(state["two_photon_opacity"])
             axis.imshow(
-                overlay_rgba, origin=mode["origin"], interpolation="bilinear",
-                extent=extent, aspect="equal", zorder=6,
+                overlay_rgba, origin="lower", interpolation="bilinear",
+                extent=state["two_photon_warped_extent"],
+                aspect="equal", zorder=6,
+            )
+        if two_photon_zoom_visible:
+            zoom_rgba = np.array(
+                state["two_photon_zoom_warped_rgba"], copy=True
+            )
+            zoom_rgba[..., 3] *= float(state["two_photon_zoom_alpha"])
+            axis.imshow(
+                zoom_rgba, origin="lower", interpolation="bilinear",
+                extent=state["two_photon_zoom_warped_extent"],
+                aspect="equal", zorder=6.5,
             )
         axis.add_patch(Polygon(
             polygon_mm, closed=True, facecolor="none",
@@ -2063,9 +3026,8 @@ def render_plane_map(
                 label.set_path_effects([
                     path_effects.withStroke(linewidth=3, foreground="black")
                 ])
-        axis.set_title(
-            mode["title"], color="white", fontsize=12, fontweight="bold", pad=8
-        )
+        axis.set_title("")
+        set_view_title(mode["title"])
         axis.set_aspect("equal", adjustable="box")
         axis.axis("off")
         close_bounds, full_bounds = calculate_bounds(
@@ -2076,6 +3038,10 @@ def render_plane_map(
             "full": full_bounds,
         }
         set_view(full_bounds if use_full else close_bounds)
+        try:
+            refresh_view_buttons()
+        except NameError:
+            pass
         draw_microct_comparison()
 
     def zoom_view(scale: float, center: tuple[float, float] | None = None) -> None:
@@ -2174,7 +3140,13 @@ def render_plane_map(
         existing = state.get("two_photon_image_path")
         if existing is not None and state.get("two_photon_image") is None:
             return Path(existing)
-        selected = choose_image_file_interactively()
+        set_status(
+            "Step 1 of 3  \u2014  choose the UNZOOMED (wide) 2p image",
+            1, "twop", flush=True,
+        )
+        print("Select the UNZOOMED (wide) 2p image...")
+        selected = choose_image_file_interactively(
+            "Select the UNZOOMED (wide) 2p image")
         if selected is not None:
             return selected
         if sys.platform == "darwin":
@@ -2186,34 +3158,113 @@ def render_plane_map(
             return None
         return Path(typed).expanduser().resolve()
 
+    def choose_two_photon_zoom_path() -> Path | None:
+        existing = state.get("two_photon_zoom_image_path")
+        if existing is not None and state.get("two_photon_zoom_image") is None:
+            return Path(existing)
+        set_status(
+            "Step 2 of 3  \u2014  choose the ZOOMED 2p image  "
+            "(cancel to skip and use the unzoomed image alone)",
+            2, "zoom", flush=True,
+        )
+        print(
+            "Select the ZOOMED 2p image... "
+            "(cancel to continue with the unzoomed image only)"
+        )
+        selected = choose_image_file_interactively(
+            "Select the ZOOMED 2p image")
+        if selected is None:
+            print("No zoomed image selected; continuing with the "
+                  "unzoomed image only.")
+            return None
+        return selected
+
+    def prompt_two_photon_magnification() -> float | None:
+        current = state.get("two_photon_magnification")
+        default = float(current) if current else DEFAULT_ZOOM_MAGNIFICATION
+        set_status(
+            "Step 2 of 3  \u2014  enter the magnification of the zoomed "
+            "image", 2, "zoom", flush=True,
+        )
+        return ask_number_interactively(
+            "Enter magnification of zoomed image", default)
+
     def begin_two_photon_mapping() -> None:
         image_path = choose_two_photon_path()
         if image_path is None:
             return
         try:
-            two_photon_image = load_two_photon_image(image_path)
+            wide_image = load_two_photon_image(image_path)
         except (OSError, ValueError, FileNotFoundError) as error:
             print(f"Could not load 2p image: {error}")
             return
         print(
-            f"Loaded actual 2p image: {image_path}\n"
-            f"  {describe_two_photon_image(two_photon_image)}"
+            f"Loaded unzoomed (wide) 2p image: {image_path}\n"
+            f"  {describe_two_photon_image(wide_image)}"
         )
         state["two_photon_image_path"] = image_path
-        state["two_photon_image"] = two_photon_image
-        state["two_photon_selecting"] = True
-        state["two_photon_selection_points"] = []
-        state["two_photon_selection_bounds"] = None
-        state["two_photon_pan"] = False
+        state["two_photon_image"] = wide_image
+        state["two_photon_zoom_warped_rgba"] = None
+        state["two_photon_zoom_homography"] = None
+        state["two_photon_zoom_to_wide"] = None
+        state["two_photon_aligning"] = False
+        state["two_photon_selecting"] = False
+
+        zoom_path = choose_two_photon_zoom_path()
+        if zoom_path is None:
+            state["two_photon_zoom_image"] = None
+            start_two_photon_corner_selection()
+            return
+        try:
+            zoom_image = load_two_photon_image(zoom_path)
+        except (OSError, ValueError, FileNotFoundError) as error:
+            print(f"Could not load zoomed 2p image: {error}")
+            print("Continuing with the unzoomed image only.")
+            state["two_photon_zoom_image"] = None
+            start_two_photon_corner_selection()
+            return
+        print(
+            f"Loaded zoomed 2p image: {zoom_path}\n"
+            f"  {describe_two_photon_image(zoom_image)}"
+        )
+        magnification = prompt_two_photon_magnification()
+        if magnification is None:
+            state["two_photon_zoom_image"] = None
+            start_two_photon_corner_selection()
+            return
+
+        state["two_photon_zoom_image_path"] = zoom_path
+        state["two_photon_zoom_image"] = zoom_image
+        state["two_photon_magnification"] = float(magnification)
+        state["two_photon_zoom_alpha"] = TWO_PHOTON_ZOOM_ALIGN_ALPHA
+        state["two_photon_aligning"] = True
+        state["two_photon_align_bounds"] = None
+        state["two_photon_align_drag"] = None
         state["drag_start"] = None
         state["drag_limits"] = None
-        print(
-            "2p corner selection is now active in the main atlas window. "
-            "Click corners in order: D1/top-left, D2/top-right, "
-            "P1/bottom-left, P2/bottom-right. The overlay is generated "
-            "automatically after the fourth click."
+        center_two_photon_zoom()
+        set_context_group("align")
+        set_status(
+            "Step 2 of 3  \u2014  drag the zoomed image onto the unzoomed "
+            "image, then press Confirm", 2, "zoom",
         )
-        draw_two_photon_selection_view(reset_view=True)
+        try:
+            zoom_alpha_slider.set_val(TWO_PHOTON_ZOOM_ALIGN_ALPHA)
+        except NameError:
+            pass
+        display_width, display_height = zoom_display_size_px(
+            magnification, wide_image.shape[:2]
+        )
+        print(
+            f"\nZoom alignment active. At {magnification:g}x the zoomed image "
+            f"covers {display_width:.1f} x {display_height:.1f} unzoomed "
+            "pixels.\n"
+            "  Drag it into place, or nudge with the arrow keys "
+            "(Shift for 10 px steps).\n"
+            "  The 'zoom alpha' slider fades it so you can see both layers.\n"
+            "  Enter or 'Zoom Done' confirms, R re-centers, Escape cancels."
+        )
+        draw_two_photon_alignment_view(reset_view=True)
         refresh_live_view()
 
     draw_region_panel()
@@ -2254,6 +3305,9 @@ def render_plane_map(
                 state["two_photon_selection_bounds"] = None
                 state["two_photon_pan"] = False
                 print("2p corner selection canceled by view switch.")
+            set_context_group(None)
+            set_status(
+                "Ready. Map 2p starts the two-photon overlay.", None, "info")
             draw_mode(mode_name)
 
         def show_full_current_view() -> None:
@@ -2271,160 +3325,218 @@ def render_plane_map(
                 return
             set_view(state["bounds"][state["mode"]]["close"])
 
-        button_specs = (
-            ("In-plane", 0.04, 0.12, lambda _event: switch_mode("in_plane")),
-            ("Coronal", 0.17, 0.10, lambda _event: switch_mode("coronal")),
-            ("Sagittal", 0.28, 0.10, lambda _event: switch_mode("sagittal")),
-            ("Axial", 0.39, 0.10, lambda _event: switch_mode("axial")),
-            ("-", 0.53, 0.055, lambda _event: zoom_view(1.25)),
-            ("+", 0.59, 0.055, lambda _event: zoom_view(0.80)),
-            ("Full", 0.655, 0.075, lambda _event: show_full_current_view()),
-        )
-        buttons = []
-        for text, left, width, callback in button_specs:
-            button_axis = figure.add_axes([left, 0.018, width, 0.045])
-            button_axis.set_facecolor("#d0d0d0")
-            button = Button(
-                button_axis, text, color="#d0d0d0", hovercolor="#e8e8e8"
-            )
-            button.label.set_color("black")
-            button.label.set_fontsize(10)
-            button.on_clicked(callback)
-            buttons.append(button)
+        TOOLBAR_Y, TOOLBAR_H = 0.018, 0.048
+        CONTEXT_Y, CONTEXT_H = 0.082, 0.042
+        SLIDER_Y, SLIDER_H = 0.092, 0.020
 
-        color_axis = figure.add_axes([0.565, 0.068, 0.095, 0.034])
-        color_axis.set_facecolor("#d0d0d0")
-        color_button = Button(
-            color_axis, "Colors on",
-            color="#d0d0d0", hovercolor="#e8e8e8",
-        )
-        color_button.label.set_color("black")
-        color_button.label.set_fontsize(8.8)
+        buttons: list[Any] = []
+
+        def register(widget: Any, group: str | None = None) -> Any:
+            buttons.append(widget)
+            if group is not None:
+                context_widgets[group].append(widget)
+                widget.ax.set_visible(False)
+                widget.set_active(False)
+            return widget
+
+        # --- primary toolbar: only what is always relevant ---------------
+        view_buttons: dict[str, Button] = {}
+        for text, mode_name, left, width in (
+            ("In-plane", "in_plane", 0.014, 0.080),
+            ("Coronal", "coronal", 0.101, 0.072),
+            ("Sagittal", "sagittal", 0.180, 0.074),
+            ("Axial", "axial", 0.261, 0.060),
+        ):
+            button = make_button(
+                figure, (left, TOOLBAR_Y, width, TOOLBAR_H), text,
+                kind="active" if mode_name == state["mode"] else "default",
+            )
+            button.on_clicked(lambda _event, name=mode_name: switch_mode(name))
+            view_buttons[mode_name] = register(button)
+
+        def sync_toggle_buttons() -> None:
+            """Colour the toggles by state, so the label can stay constant."""
+            style_button(
+                color_button,
+                "active" if state["show_atlas_colors"] else "default")
+            style_button(
+                label_button,
+                "active" if state["show_labels"] else "default")
+            style_button(
+                fill_button,
+                "active" if state["show_prism_fill"] else "default")
+            style_button(
+                two_photon_toggle_button,
+                "twop" if state["show_two_photon"] else "default")
+            style_button(
+                zoom_toggle_button,
+                "zoom" if state["show_two_photon_zoom"] else "default")
+            figure.canvas.draw_idle()
+
+        def refresh_view_buttons() -> None:
+            for mode_name, view_button in view_buttons.items():
+                style_button(
+                    view_button,
+                    "active" if state["mode"] == mode_name else "default",
+                )
+
+        for text, left, width, callback in (
+            ("\u2212", 0.339, 0.036, lambda _event: zoom_view(1.25)),
+            ("+", 0.382, 0.036, lambda _event: zoom_view(0.80)),
+            ("Fit", 0.425, 0.048, lambda _event: show_full_current_view()),
+        ):
+            button = make_button(figure, (left, TOOLBAR_Y, width, TOOLBAR_H), text)
+            button.on_clicked(callback)
+            register(button)
+
+        color_button = make_button(
+            figure, (0.485, TOOLBAR_Y, 0.064, TOOLBAR_H), "Colors")
 
         def on_color_toggle(_event: Any) -> None:
             state["show_atlas_colors"] = not state["show_atlas_colors"]
-            color_button.label.set_text(
-                "Colors on" if state["show_atlas_colors"] else "Gray atlas"
-            )
-            if state["two_photon_selecting"]:
-                draw_two_photon_selection_view(reset_view=False)
+            sync_toggle_buttons()
+            if state["two_photon_selecting"] or state["two_photon_aligning"]:
+                figure.canvas.draw_idle()
                 return
             draw_mode(state["mode"])
 
         color_button.on_clicked(on_color_toggle)
-        buttons.append(color_button)
+        register(color_button)
 
-        label_axis = figure.add_axes([0.67, 0.068, 0.095, 0.034])
-        label_axis.set_facecolor("#d0d0d0")
-        label_button = Button(
-            label_axis, "Labels on",
-            color="#d0d0d0", hovercolor="#e8e8e8",
-        )
-        label_button.label.set_color("black")
-        label_button.label.set_fontsize(8.8)
+        label_button = make_button(
+            figure, (0.556, TOOLBAR_Y, 0.064, TOOLBAR_H), "Labels")
 
         def on_label_toggle(_event: Any) -> None:
             state["show_labels"] = not state["show_labels"]
-            label_button.label.set_text(
-                "Labels on" if state["show_labels"] else "Labels off"
-            )
-            if state["two_photon_selecting"]:
-                draw_two_photon_selection_view(reset_view=False)
+            sync_toggle_buttons()
+            if state["two_photon_selecting"] or state["two_photon_aligning"]:
+                figure.canvas.draw_idle()
                 return
             draw_mode(state["mode"])
 
         label_button.on_clicked(on_label_toggle)
-        buttons.append(label_button)
+        register(label_button)
 
-        fill_axis = figure.add_axes([0.565, 0.105, 0.095, 0.034])
-        fill_axis.set_facecolor("#d0d0d0")
-        fill_button = Button(
-            fill_axis, "Fill on",
-            color="#d0d0d0", hovercolor="#e8e8e8",
-        )
-        fill_button.label.set_color("black")
-        fill_button.label.set_fontsize(8.8)
+        layers_button = make_button(
+            figure, (0.627, TOOLBAR_Y, 0.062, TOOLBAR_H), "Layers")
 
-        def on_fill_toggle(_event: Any) -> None:
-            state["show_prism_fill"] = not state["show_prism_fill"]
-            fill_button.label.set_text(
-                "Fill on" if state["show_prism_fill"] else "Fill off"
-            )
-            if state["two_photon_selecting"]:
-                draw_two_photon_selection_view(reset_view=False)
+        def on_layers_toggle(_event: Any) -> None:
+            if state["two_photon_aligning"] or state["two_photon_selecting"]:
+                print("Finish or cancel the current 2p step first.")
                 return
-            draw_mode(state["mode"])
+            set_context_group(
+                None if state["context_group"] == "layers" else "layers")
 
-        fill_button.on_clicked(on_fill_toggle)
-        buttons.append(fill_button)
+        layers_button.on_clicked(on_layers_toggle)
+        register(layers_button)
 
-        two_photon_axis = figure.add_axes([0.77, 0.068, 0.105, 0.034])
-        two_photon_axis.set_facecolor(TWO_PHOTON_BUTTON_COLOR)
-        two_photon_button = Button(
-            two_photon_axis, "2p Mapper",
-            color=TWO_PHOTON_BUTTON_COLOR,
-            hovercolor=TWO_PHOTON_BUTTON_HOVER_COLOR,
-        )
-        two_photon_button.label.set_color("black")
-        two_photon_button.label.set_fontsize(8.6)
-        two_photon_button.label.set_fontweight("bold")
+        two_photon_button = make_button(
+            figure, (0.755, TOOLBAR_Y, 0.080, TOOLBAR_H), "Map 2p",
+            kind="twop")
         two_photon_button.on_clicked(lambda _event: begin_two_photon_mapping())
-        buttons.append(two_photon_button)
+        register(two_photon_button)
 
-        two_photon_toggle_axis = figure.add_axes([0.885, 0.068, 0.085, 0.034])
-        two_photon_toggle_axis.set_facecolor(TWO_PHOTON_BUTTON_COLOR)
-        two_photon_toggle_button = Button(
-            two_photon_toggle_axis, "2p on",
-            color=TWO_PHOTON_BUTTON_COLOR,
-            hovercolor=TWO_PHOTON_BUTTON_HOVER_COLOR,
-        )
-        two_photon_toggle_button.label.set_color("black")
-        two_photon_toggle_button.label.set_fontsize(8.6)
-        two_photon_toggle_button.label.set_fontweight("bold")
+        help_button = make_button(
+            figure, (0.842, TOOLBAR_Y, 0.030, TOOLBAR_H), "?")
+        help_button.on_clicked(lambda _event: print(CONTROLS_HELP))
+        register(help_button)
 
-        def on_two_photon_toggle(_event: Any) -> None:
+        panel_button = make_button(
+            figure, (0.879, TOOLBAR_Y, 0.052, TOOLBAR_H), "Panel")
+
+        def on_panel_toggle(_event: Any) -> None:
+            state["show_region_panel"] = not state["show_region_panel"]
+            panel_button.label.set_text(
+                "Panel" if state["show_region_panel"] else "Panel +")
+            apply_viewer_layout()
+            figure.canvas.draw_idle()
+
+        panel_button.on_clicked(on_panel_toggle)
+        register(panel_button)
+
+        done_button = make_button(
+            figure, (0.938, TOOLBAR_Y, 0.050, TOOLBAR_H), "Done")
+        done_button.label.set_fontweight("bold")
+
+        def on_done(_event: Any) -> None:
+            if state["two_photon_aligning"]:
+                print("Confirm or cancel the zoom alignment first.")
+                return
             if state["two_photon_selecting"]:
-                print("Finish or cancel 2p corner selection before toggling the overlay.")
+                print("Finish or cancel 2p corner selection first.")
                 return
-            state["show_two_photon"] = not state["show_two_photon"]
-            two_photon_toggle_button.label.set_text(
-                "2p on" if state["show_two_photon"] else "2p off"
+            print("Finishing: closing the atlas mapper window.")
+            plt.close(figure)
+
+        done_button.on_clicked(on_done)
+        register(done_button)
+
+        # --- contextual row: alignment -----------------------------------
+        confirm_button = make_button(
+            figure, (0.014, CONTEXT_Y, 0.092, CONTEXT_H), "Confirm",
+            kind="zoom")
+        confirm_button.on_clicked(
+            lambda _event: complete_two_photon_alignment()
+            if state["two_photon_aligning"] else None)
+        register(confirm_button, "align")
+
+        recentre_button = make_button(
+            figure, (0.113, CONTEXT_Y, 0.088, CONTEXT_H), "Re-centre")
+        recentre_button.on_clicked(
+            lambda _event: reset_two_photon_alignment()
+            if state["two_photon_aligning"] else None)
+        register(recentre_button, "align")
+
+        magnification_button = make_button(
+            figure, (0.208, CONTEXT_Y, 0.092, CONTEXT_H),
+            f"Mag {state['two_photon_magnification']:g}x")
+
+        def on_change_magnification(_event: Any) -> None:
+            """Re-scale the zoom about its centre so it does not jump."""
+            if not state["two_photon_aligning"]:
+                return
+            current = float(state["two_photon_magnification"])
+            value = ask_number_interactively(
+                "Enter magnification of zoomed image", current)
+            if value is None or value <= 0.0 or value == current:
+                return
+            wide_shape = state["two_photon_image"].shape[:2]
+            old_width, old_height = zoom_display_size_px(current, wide_shape)
+            new_width, new_height = zoom_display_size_px(value, wide_shape)
+            translate_x, translate_y = state["two_photon_zoom_translation"]
+            state["two_photon_zoom_translation"] = (
+                translate_x + (old_width - new_width) / 2.0,
+                translate_y + (old_height - new_height) / 2.0,
             )
-            draw_mode(state["mode"])
+            state["two_photon_magnification"] = float(value)
+            magnification_button.label.set_text(f"Mag {value:g}x")
+            draw_two_photon_alignment_view(reset_view=False)
 
-        two_photon_toggle_button.on_clicked(on_two_photon_toggle)
-        buttons.append(two_photon_toggle_button)
+        magnification_button.on_clicked(on_change_magnification)
+        register(magnification_button, "align")
 
-        two_photon_undo_axis = figure.add_axes([0.735, 0.018, 0.075, 0.045])
-        two_photon_undo_axis.set_facecolor(TWO_PHOTON_BUTTON_COLOR)
-        two_photon_undo_button = Button(
-            two_photon_undo_axis, "2p Undo",
-            color=TWO_PHOTON_BUTTON_COLOR,
-            hovercolor=TWO_PHOTON_BUTTON_HOVER_COLOR,
-        )
-        two_photon_undo_button.label.set_color("black")
-        two_photon_undo_button.label.set_fontsize(8.6)
-        two_photon_undo_button.label.set_fontweight("bold")
+        check_button = make_button(
+            figure, (0.307, CONTEXT_Y, 0.070, CONTEXT_H), "Check")
+        check_button.on_clicked(
+            lambda _event: report_zoom_alignment_quality()
+            if state["two_photon_aligning"] else None)
+        register(check_button, "align")
 
-        def on_two_photon_undo(_event: Any) -> None:
-            if not state["two_photon_selecting"]:
-                print("2p undo is available during 2p corner selection.")
-                return
-            undo_two_photon_selection()
+        align_alpha_slider = make_slider(
+            figure, (0.420, SLIDER_Y, 0.170, SLIDER_H), "zoom alpha",
+            state["two_photon_zoom_alpha"], TWO_PHOTON_ZOOM_BUTTON_COLOR)
 
-        two_photon_undo_button.on_clicked(on_two_photon_undo)
-        buttons.append(two_photon_undo_button)
+        # --- contextual row: corner selection ----------------------------
+        two_photon_undo_button = make_button(
+            figure, (0.014, CONTEXT_Y, 0.078, CONTEXT_H), "Undo", kind="twop")
+        two_photon_undo_button.on_clicked(
+            lambda _event: undo_two_photon_selection()
+            if state["two_photon_selecting"] else None)
+        register(two_photon_undo_button, "corners")
 
-        two_photon_pan_axis = figure.add_axes([0.815, 0.018, 0.095, 0.045])
-        two_photon_pan_axis.set_facecolor(TWO_PHOTON_BUTTON_COLOR)
-        two_photon_pan_button = Button(
-            two_photon_pan_axis, "2p Pan off",
-            color=TWO_PHOTON_BUTTON_COLOR,
-            hovercolor=TWO_PHOTON_BUTTON_HOVER_COLOR,
-        )
-        two_photon_pan_button.label.set_color("black")
-        two_photon_pan_button.label.set_fontsize(8.4)
-        two_photon_pan_button.label.set_fontweight("bold")
+        two_photon_pan_button = make_button(
+            figure, (0.099, CONTEXT_Y, 0.078, CONTEXT_H), "Pan off",
+            kind="twop")
 
         def toggle_two_photon_pan() -> None:
             if not state["two_photon_selecting"]:
@@ -2434,121 +3546,154 @@ def render_plane_map(
             state["drag_start"] = None
             state["drag_limits"] = None
             two_photon_pan_button.label.set_text(
-                "2p Pan on" if state["two_photon_pan"] else "2p Pan off"
-            )
+                "Pan on" if state["two_photon_pan"] else "Pan off")
             draw_two_photon_selection_view(reset_view=False)
 
         two_photon_pan_button.on_clicked(lambda _event: toggle_two_photon_pan())
-        buttons.append(two_photon_pan_button)
+        register(two_photon_pan_button, "corners")
 
-        opacity_axis = figure.add_axes([0.78, 0.105, 0.19, 0.018])
-        opacity_slider = Slider(
-            opacity_axis, "2p opacity", 0.0, 1.0,
-            valinit=state["two_photon_opacity"], valstep=0.05,
-            color="#ff5a5a",
-        )
-        opacity_slider.label.set_color("white")
-        opacity_slider.label.set_fontsize(8.0)
-        opacity_slider.valtext.set_color("white")
-        opacity_slider.valtext.set_fontsize(8.0)
+        # --- contextual row: layers --------------------------------------
+        fill_button = make_button(
+            figure, (0.014, CONTEXT_Y, 0.060, CONTEXT_H), "Fill")
+
+        def on_fill_toggle(_event: Any) -> None:
+            state["show_prism_fill"] = not state["show_prism_fill"]
+            sync_toggle_buttons()
+            draw_mode(state["mode"])
+
+        fill_button.on_clicked(on_fill_toggle)
+        register(fill_button, "layers")
+
+        two_photon_toggle_button = make_button(
+            figure, (0.081, CONTEXT_Y, 0.070, CONTEXT_H), "2p", kind="twop")
+
+        def on_two_photon_toggle(_event: Any) -> None:
+            state["show_two_photon"] = not state["show_two_photon"]
+            sync_toggle_buttons()
+            draw_mode(state["mode"])
+
+        two_photon_toggle_button.on_clicked(on_two_photon_toggle)
+        register(two_photon_toggle_button, "layers")
+
+        zoom_toggle_button = make_button(
+            figure, (0.158, CONTEXT_Y, 0.078, CONTEXT_H), "Zoom",
+            kind="zoom")
+
+        def on_zoom_toggle(_event: Any) -> None:
+            state["show_two_photon_zoom"] = not state["show_two_photon_zoom"]
+            sync_toggle_buttons()
+            draw_mode(state["mode"])
+
+        zoom_toggle_button.on_clicked(on_zoom_toggle)
+        register(zoom_toggle_button, "layers")
+
+        opacity_slider = make_slider(
+            figure, (0.330, SLIDER_Y, 0.140, SLIDER_H), "2p opacity",
+            state["two_photon_opacity"], TWO_PHOTON_BUTTON_COLOR)
 
         def on_opacity_change(value: float) -> None:
             state["two_photon_opacity"] = float(value)
-            if state["two_photon_selecting"]:
+            if state["two_photon_selecting"] or state["two_photon_aligning"]:
                 return
             if state["two_photon_warped_rgba"] is not None:
                 draw_mode(state["mode"])
 
         opacity_slider.on_changed(on_opacity_change)
-        buttons.append(opacity_slider)
+        register(opacity_slider, "layers")
 
+        zoom_alpha_slider = make_slider(
+            figure, (0.560, SLIDER_Y, 0.140, SLIDER_H), "zoom alpha",
+            state["two_photon_zoom_alpha"], TWO_PHOTON_ZOOM_BUTTON_COLOR)
+
+        def on_zoom_alpha_change(value: float) -> None:
+            state["two_photon_zoom_alpha"] = float(value)
+            if state["two_photon_aligning"]:
+                align_alpha_slider.eventson = False
+                align_alpha_slider.set_val(value)
+                align_alpha_slider.eventson = True
+                draw_two_photon_alignment_view(reset_view=False)
+                return
+            if state["two_photon_selecting"]:
+                return
+            if state["two_photon_zoom_warped_rgba"] is not None:
+                draw_mode(state["mode"])
+
+        zoom_alpha_slider.on_changed(on_zoom_alpha_change)
+        register(zoom_alpha_slider, "layers")
+        align_alpha_slider.on_changed(on_zoom_alpha_change)
+        register(align_alpha_slider, "align")
+
+        # --- contextual row: microCT comparison --------------------------
         compare_button = None
         microct_pan_button = None
         if microct_available:
-            compare_axis = figure.add_axes([0.04, 0.068, 0.12, 0.034])
-            compare_axis.set_facecolor("#d0d0d0")
-            compare_button = Button(
-                compare_axis, "Compare uCT",
-                color="#d0d0d0", hovercolor="#e8e8e8",
-            )
-            compare_button.label.set_color("black")
-            compare_button.label.set_fontsize(9.2)
+            compare_button = make_button(
+                figure, (0.696, TOOLBAR_Y, 0.052, TOOLBAR_H), "uCT")
 
             def on_compare(_event: Any) -> None:
-                if state["two_photon_selecting"]:
-                    print("Finish or cancel 2p corner selection before comparing uCT.")
+                if state["two_photon_selecting"] or state["two_photon_aligning"]:
+                    print("Finish or cancel the current 2p step first.")
                     return
                 state["compare_microct"] = not state["compare_microct"]
-                compare_button.label.set_text(
-                    "Atlas only" if state["compare_microct"] else "Compare uCT"
-                )
-                if (
-                    state["compare_microct"]
-                    and state["mode"] == "in_plane"
-                ):
+                style_button(
+                    compare_button,
+                    "active" if state["compare_microct"] else "default")
+                set_context_group("uct" if state["compare_microct"] else None)
+                if state["compare_microct"] and state["mode"] == "in_plane":
                     draw_mode(nearest_mode)
                     return
                 draw_mode(state["mode"])
 
             compare_button.on_clicked(on_compare)
-            buttons.append(compare_button)
+            register(compare_button)
 
             def ensure_microct_comparison() -> bool:
-                if state["mode"] == "in_plane":
+                if not state["compare_microct"]:
                     state["compare_microct"] = True
-                    compare_button.label.set_text("Atlas only")
-                    draw_mode(nearest_mode)
-                elif not state["compare_microct"]:
-                    state["compare_microct"] = True
-                    compare_button.label.set_text("Atlas only")
-                    draw_mode(state["mode"])
+                    style_button(compare_button, "active")
+                    set_context_group("uct")
+                    draw_mode(
+                        nearest_mode if state["mode"] == "in_plane"
+                        else state["mode"])
                 return comparison_active()
 
-            microct_zoom_specs = (
-                ("uCT +", 0.18, 0.075, lambda _event: (
-                    ensure_microct_comparison() and zoom_microct_view(0.80)
-                )),
-                ("uCT -", 0.265, 0.075, lambda _event: (
-                    ensure_microct_comparison() and zoom_microct_view(1.25)
-                )),
-                ("uCT 1x", 0.35, 0.085, lambda _event: (
-                    ensure_microct_comparison() and reset_microct_view()
-                )),
-            )
-            for text, left, width, callback in microct_zoom_specs:
-                zoom_axis = figure.add_axes([left, 0.068, width, 0.034])
-                zoom_axis.set_facecolor("#d0d0d0")
-                zoom_button = Button(
-                    zoom_axis, text, color="#d0d0d0", hovercolor="#e8e8e8"
-                )
-                zoom_button.label.set_color("black")
-                zoom_button.label.set_fontsize(9.2)
-                zoom_button.on_clicked(callback)
-                buttons.append(zoom_button)
+            for text, left, width, callback in (
+                ("uCT +", 0.014, 0.060,
+                 lambda _event: ensure_microct_comparison() and zoom_microct_view(0.80)),
+                ("uCT \u2212", 0.081, 0.060,
+                 lambda _event: ensure_microct_comparison() and zoom_microct_view(1.25)),
+                ("uCT 1x", 0.148, 0.064,
+                 lambda _event: ensure_microct_comparison() and reset_microct_view()),
+            ):
+                button = make_button(figure, (left, CONTEXT_Y, width, CONTEXT_H), text)
+                button.on_clicked(callback)
+                register(button, "uct")
 
-            pan_axis = figure.add_axes([0.445, 0.068, 0.105, 0.034])
-            pan_axis.set_facecolor("#d0d0d0")
-            microct_pan_button = Button(
-                pan_axis, "uCT Pan off",
-                color="#d0d0d0", hovercolor="#e8e8e8",
-            )
-            microct_pan_button.label.set_color("black")
-            microct_pan_button.label.set_fontsize(8.8)
+            microct_pan_button = make_button(
+                figure, (0.219, CONTEXT_Y, 0.082, CONTEXT_H), "uCT Pan off")
 
             def on_microct_pan(_event: Any) -> None:
                 if ensure_microct_comparison():
                     state["microct_pan"] = not state["microct_pan"]
                     microct_pan_button.label.set_text(
-                        "uCT Pan on" if state["microct_pan"] else "uCT Pan off"
-                    )
+                        "uCT Pan on" if state["microct_pan"] else "uCT Pan off")
                     state["microct_drag_start"] = None
                     state["microct_drag_limits"] = None
                     figure.canvas.draw_idle()
 
             microct_pan_button.on_clicked(on_microct_pan)
-            buttons.append(microct_pan_button)
+            register(microct_pan_button, "uct")
         else:
+            def ensure_microct_comparison() -> bool:
+                return False
+
             print("MicroCT comparison disabled: no source microCT image was found.")
+
+        sync_toggle_buttons()
+        set_context_group(None)
+        set_status(
+            "Ready. Map 2p starts the two-photon overlay.  "
+            "Done or Q finishes.", None, "info")
 
         def on_scroll(event: Any) -> None:
             if event.inaxes is microct_axis and comparison_active():
@@ -2562,6 +3707,19 @@ def render_plane_map(
             zoom_view(0.80 if event.button == "up" else 1.25, center)
 
         def on_press(event: Any) -> None:
+            if state["two_photon_aligning"]:
+                if (
+                    event.inaxes is axis and event.button == 1
+                    and event.xdata is not None and event.ydata is not None
+                ):
+                    translate_x, translate_y = state[
+                        "two_photon_zoom_translation"
+                    ]
+                    state["two_photon_align_drag"] = (
+                        float(event.xdata), float(event.ydata),
+                        translate_x, translate_y,
+                    )
+                return
             if state["two_photon_selecting"]:
                 if event.inaxes is axis and event.button == 1:
                     if event.xdata is not None and event.ydata is not None:
@@ -2587,6 +3745,20 @@ def render_plane_map(
             state["drag_limits"] = (axis.get_xlim(), axis.get_ylim())
 
         def on_motion(event: Any) -> None:
+            if state["two_photon_aligning"]:
+                drag = state["two_photon_align_drag"]
+                if (
+                    drag is None or event.inaxes is not axis
+                    or event.xdata is None or event.ydata is None
+                ):
+                    return
+                press_x, press_y, origin_x, origin_y = drag
+                state["two_photon_zoom_translation"] = (
+                    origin_x + (float(event.xdata) - press_x),
+                    origin_y + (float(event.ydata) - press_y),
+                )
+                draw_two_photon_alignment_view(reset_view=False)
+                return
             if state["two_photon_selecting"]:
                 if (
                     not state["two_photon_pan"]
@@ -2630,12 +3802,15 @@ def render_plane_map(
             ))
 
         def on_release(_event: Any) -> None:
+            state["two_photon_align_drag"] = None
             state["drag_start"] = None
             state["drag_limits"] = None
             state["microct_drag_start"] = None
             state["microct_drag_limits"] = None
 
         def on_close(_event: Any) -> None:
+            state["two_photon_aligning"] = False
+            state["two_photon_align_drag"] = None
             state["two_photon_selecting"] = False
             state["two_photon_pan"] = False
             state["drag_start"] = None
@@ -2645,6 +3820,26 @@ def render_plane_map(
             print("Atlas mapper visualization closed cleanly.")
 
         def on_key(event: Any) -> None:
+            if state["two_photon_aligning"]:
+                nudges = {
+                    "left": (-1.0, 0.0), "right": (1.0, 0.0),
+                    "up": (0.0, -1.0), "down": (0.0, 1.0),
+                }
+                coarse = {
+                    "shift+left": (-10.0, 0.0), "shift+right": (10.0, 0.0),
+                    "shift+up": (0.0, -10.0), "shift+down": (0.0, 10.0),
+                }
+                if event.key in nudges:
+                    nudge_two_photon_zoom(*nudges[event.key])
+                elif event.key in coarse:
+                    nudge_two_photon_zoom(*coarse[event.key])
+                elif event.key in ("enter", "return"):
+                    complete_two_photon_alignment()
+                elif event.key in ("r", "home"):
+                    reset_two_photon_alignment()
+                elif event.key == "escape":
+                    cancel_two_photon_alignment()
+                return
             if event.key in ("escape", "q"):
                 if state["two_photon_selecting"]:
                     cancel_two_photon_selection()
@@ -2673,27 +3868,21 @@ def render_plane_map(
                 switch_mode("axial")
             elif event.key == "g":
                 state["show_atlas_colors"] = not state["show_atlas_colors"]
-                color_button.label.set_text(
-                    "Colors on" if state["show_atlas_colors"] else "Gray atlas"
-                )
+                sync_toggle_buttons()
                 if state["two_photon_selecting"]:
                     draw_two_photon_selection_view(reset_view=False)
                     return
                 draw_mode(state["mode"])
             elif event.key == "l":
                 state["show_labels"] = not state["show_labels"]
-                label_button.label.set_text(
-                    "Labels on" if state["show_labels"] else "Labels off"
-                )
+                sync_toggle_buttons()
                 if state["two_photon_selecting"]:
                     draw_two_photon_selection_view(reset_view=False)
                     return
                 draw_mode(state["mode"])
             elif event.key == "f":
                 state["show_prism_fill"] = not state["show_prism_fill"]
-                fill_button.label.set_text(
-                    "Fill on" if state["show_prism_fill"] else "Fill off"
-                )
+                sync_toggle_buttons()
                 if state["two_photon_selecting"]:
                     draw_two_photon_selection_view(reset_view=False)
                     return
@@ -2703,9 +3892,7 @@ def render_plane_map(
                     print("Finish or cancel 2p corner selection before toggling the overlay.")
                     return
                 state["show_two_photon"] = not state["show_two_photon"]
-                two_photon_toggle_button.label.set_text(
-                    "2p on" if state["show_two_photon"] else "2p off"
-                )
+                sync_toggle_buttons()
                 draw_mode(state["mode"])
             elif event.key == "m" and microct_available:
                 if state["two_photon_selecting"]:
@@ -2745,21 +3932,7 @@ def render_plane_map(
         figure.canvas.mpl_connect("key_press_event", on_key)
         figure.canvas.mpl_connect("close_event", on_close)
         figure._microprism_buttons = buttons
-        print(
-            "Viewer controls: In-plane/I, Coronal/C, Sagittal/S, and Axial/A "
-            "switch views. Drag or use arrows to pan; scroll or +/- zooms; "
-            "Full/0 shows the whole slice; R resets the current view. "
-            "Compare uCT/M shows the source microCT beside standard atlas views; "
-            "scroll over the microCT panel to change its slice. uCT Pan/P lets "
-            "you drag the zoomed microCT panel. Colors/G switches atlas colors "
-            "versus grayscale, and Labels/L hides or shows P1/P2/D1/D2 labels. "
-            "Fill/F toggles the red prism fill. Map 2p starts JPG corner "
-            "selection; use 2p Undo/Z to remove the last selected corner, "
-            "2p Pan/P to drag the 2p image during corner selection, and scroll "
-            "or +/- to zoom. 2p opacity controls texture transparency; T toggles "
-            "the mapped 2p overlay. "
-            f"Nearest standard view for this prism: {nearest_mode}."
-        )
+        print(CONTROLS_HELP)
         plt.show()
     else:
         plt.close(figure)
@@ -2913,9 +4086,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--two-photon-image",
         help=(
-            "Optional JPG/PNG 2p image to map onto the in-plane prism view. "
-            "If omitted, the Map 2p button prompts for a path."
+            "Optional unzoomed (wide) JPG/PNG 2p image to map onto the "
+            "in-plane prism view. If omitted, the 2p Mapper button "
+            "prompts for a path."
         ),
+    )
+    parser.add_argument(
+        "--two-photon-zoom-image",
+        help=(
+            "Optional zoomed 2p JPG/PNG to scale and align on top of the "
+            "unzoomed image before both are mapped onto the prism plane."
+        ),
+    )
+    parser.add_argument(
+        "--two-photon-magnification",
+        type=float,
+        default=DEFAULT_ZOOM_MAGNIFICATION,
+        help=(
+            "Magnification of the zoomed 2p image relative to the "
+            "unzoomed one. At 2 the zoom covers half the unzoomed field "
+            "of view in each direction."
+        ),
+    )
+    parser.add_argument(
+        "--two-photon-render-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Sampling density for the mapped 2p layers, relative to the "
+            "source images. 1.0 keeps their native resolution; 2.0 "
+            "oversamples. Capped at "
+            f"{MAX_TWO_PHOTON_RENDER_PX} pixels per side."
+        ),
+    )
+    parser.add_argument(
+        "--two-photon-zoom-opacity",
+        type=float,
+        default=TWO_PHOTON_ZOOM_OVERLAY_ALPHA,
+        help="Initial opacity for the mapped zoom layer, from 0 to 1.",
     )
     parser.add_argument(
         "--two-photon-opacity",
@@ -3067,6 +4275,15 @@ def main() -> None:
             project_candidate = project / candidate
             candidate = project_candidate if project_candidate.exists() else candidate
         two_photon_image_path = candidate.resolve()
+    two_photon_zoom_image_path = None
+    if args.two_photon_zoom_image:
+        candidate = Path(args.two_photon_zoom_image).expanduser()
+        if not candidate.is_absolute():
+            project_candidate = project / candidate
+            candidate = (
+                project_candidate if project_candidate.exists() else candidate
+            )
+        two_photon_zoom_image_path = candidate.resolve()
     coordinate_space = infer_coordinate_space(
         args.coordinate_space, tracker_data, annotation.shape
     )
@@ -3207,13 +4424,13 @@ def main() -> None:
             },
             "sagittal": {
                 "slice_index": "X / ML",
-                "plot_x": "Y / DV",
-                "plot_y": "Z / AP, displayed with negative sign",
+                "plot_x": "Z / AP",
+                "plot_y": "Y / DV, displayed with negative sign so dorsal is up",
             },
             "axial": {
                 "slice_index": "Y / DV",
-                "plot_x": "X / ML",
-                "plot_y": "Z / AP, displayed with negative sign",
+                "plot_x": "Z / AP",
+                "plot_y": "X / ML, displayed with negative sign",
             },
         },
         "plane_method": (
@@ -3237,6 +4454,10 @@ def main() -> None:
         args.initial_view, max(float(args.zoom_context_mm), 0.1),
         two_photon_image_path,
         float(np.clip(args.two_photon_opacity, 0.0, 1.0)),
+        two_photon_zoom_image_path,
+        float(args.two_photon_magnification),
+        float(np.clip(args.two_photon_zoom_opacity, 0.0, 1.0)),
+        max(float(args.two_photon_render_scale), 0.05),
     )
     print_summary(corner_rows, face_summary)
     print(f"CSV summary: {summary_path}")

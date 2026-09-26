@@ -2,8 +2,7 @@
 microprism_corner_tracker.py  (v10 - commented + padded UI)
 ─────────────────────────────────────────────────────────────────────────────
 Interactive tool for marking microprism mirror-face corners in microCT brain
-volumes. Matches the postdoc's UI style (light wheat/cream background, black
-text, standard matplotlib colors) from midline_alignment.py.
+volumes.
 
 3D DIAGRAM
 ──────────
