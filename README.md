@@ -1,21 +1,33 @@
-# mfaCTpy: MicroCT Mouse Brain Registration to Allen CCF
+# mfaCTpy (microprism fork): MicroCT Registration and Two-Photon Mapping
 
-**New version available!** https://github.com/Sakata-Lab/mfaCTpy2
+> **This is a modified fork.** The original is
+> [Sakata-Lab/mfaCTpy](https://github.com/Sakata-Lab/mfaCTpy), which registers
+> microCT mouse brain volumes to the Allen CCF and traces implanted multi-fiber
+> arrays. This fork adapts that pipeline for **microprism imaging**: locating
+> the prism's imaging face inside the mouse brain, and mapping two-photon images onto
+> that face so individual cells can be assigned to Allen atlas regions.
+>
+> Modified by Jyothi and Dr. Adam Gordon-Fennell (Stuber Lab, University of Washington). Distributed under
+> GPL v3, the same licence as the original. See
+> [What this fork adds](#what-this-fork-adds) for the full list of changes.
+>
+> Upstream also has a newer version: https://github.com/Sakata-Lab/mfaCTpy2
 
-## User Guide v1.1
+## User Guide v1.1 (microprism fork)
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Installation](#installation)
-3. [Data Structure](#data-structure)
-4. [Module Reference](#module-reference)
-5. [Workflow Overview](#workflow-overview)
-6. [Step-by-Step Instructions](#step-by-step-instructions)
-7. [Troubleshooting](#troubleshooting)
-8. [Tips for Best Results](#tips-for-best-results)
+2. [What This Fork Adds](#what-this-fork-adds)
+3. [Installation](#installation)
+4. [Data Structure](#data-structure)
+5. [Module Reference](#module-reference)
+6. [Workflow Overview](#workflow-overview)
+7. [Step-by-Step Instructions](#step-by-step-instructions)
+8. [Troubleshooting](#troubleshooting)
+9. [Tips for Best Results](#tips-for-best-results)
 
 ---
 
@@ -39,6 +51,57 @@
 - Registering microCT mouse brain scans to a standard atlas
 - Visualizing fiber placement in anatomical context
 - Creating presentation materials from 3D brain volumes
+
+---
+
+## What This Fork Adds
+
+The original pipeline answers one question: *where are the implanted fibers, and
+which brain regions do they sit in?* This fork answers a different one: *where
+exactly is the microprism's imaging face inside the brain, and where does each
+cell I can see through it actually live?*
+
+Everything upstream is unchanged in purpose and still required. DICOM
+conversion, midline alignment and landmark registration to the Allen CCF run
+exactly as before; the microprism work sits on top of a registered volume.
+
+### New modules
+
+| File | What it does |
+| --- | --- |
+| `microprism_corner_tracker.py` | Interactively mark the physical prism corners in the microCT volume. Derives the two missing corners of the imaging face and writes `microprism_corners.json`. |
+| `microprism_atlas_mapper.py` | Transform that face into Allen CCF space, sample the atlas along it, report the regions it crosses, and overlay two-photon images onto it. |
+| `microprism_registration_qc_3d.py` | 3D quality-control view of the microprism-to-Allen registration. |
+| `microprism_v2.py` | Earlier standalone revision of the corner tracker, kept for reference. |
+| `allen_ccf_resources.py` | Downloads and caches the Allen annotation volume, average template and ontology. |
+| `project_paths.py` | Shared project-path resolution for the command-line scripts. |
+
+### Modified upstream modules
+
+`landmark_registration.py`, `midline_alignment.py`,
+`registered_img_visualization.py`, `fiber_visualizer_3d.py`,
+`dicom_loader.py`, `data_loader.py` and `fiber_tracker.py` have all been
+changed to support the microprism workflow.
+
+### The mapping chain
+
+A cell seen in a zoomed two-photon image reaches an Allen region through three
+steps, each documented in `docs/microprism_atlas_mapping.md`:
+
+1. **Zoomed image to unzoomed image.** The zoom is a magnified view of part of
+   the unzoomed field, so this is scale and translation only. The scale comes
+   from the magnification you enter; the translation comes from dragging the
+   zoom into place. Both are saved.
+2. **Unzoomed image to the prism face.** The prism sits at an angle in the
+   brain, so its square face photographs as a tilted quadrilateral. Clicking
+   four corners determines a projective transform (a homography), which handles
+   rotation and perspective as well as scale and position.
+3. **Prism face to the Allen CCF.** The face's position in atlas space is
+   already known from the corner tracker and registration, so a position in
+   millimetres on the face becomes an X, Y, Z voxel and hence a region.
+
+Because all three are linear maps on homogeneous coordinates, they compose into
+a single matrix, so each cell is transformed in one step rather than three.
 
 ---
 
@@ -384,14 +447,60 @@ face, labels the region at each corner, and saves CSV and JSON region summaries.
 The face is rectified to a true rectangle using the prism width/length ratio
 entered in the tracker, so affine registration skew is not shown as physical
 prism tilt.
-The interactive viewer starts centered on the prism. Scroll or use `+`/`-` to
-zoom. Use `In-plane`, `Coronal`, `Sagittal`, and `Axial` to switch perspectives.
-Click-drag the image, use the arrow controls, or press the arrow keys to pan.
-Choose `Full` (or press `F`) for the complete current slice, and press `R` to
-reset its zoom. The Allen average anatomical template is displayed beneath
-translucent annotation colors and region boundaries. Use `--no-template` for
-the label-only view. The full calculation is documented in
-`docs/microprism_atlas_mapping.md`.
+#### Overlaying two-photon images
+
+The mapper can place two-photon images onto the prism face. Click **Map 2p**
+and it walks through three steps, with the current step shown in the banner at
+the top of the window:
+
+1. **Choose the unzoomed (wide) image.** Its field of view should cover the
+   whole prism face, with the black border visible around the edge.
+2. **Choose the zoomed image and enter its magnification.** At 2x the zoom
+   covers half the unzoomed field in each direction. Drag it into position over
+   the unzoomed image, or nudge with the arrow keys (Shift for 10-pixel steps).
+   **Mag** changes the magnification without losing your placement, the **zoom
+   alpha** slider fades the zoom so both layers are visible, and **Check**
+   scores the alignment against the image data and names a better offset if one
+   exists. **Confirm** accepts it. Cancelling the second file picker skips the
+   zoom entirely and uses the unzoomed image alone.
+3. **Click the four corners of the unzoomed image**, in the order D1 top-left,
+   D2 top-right, P1 bottom-left, P2 bottom-right, along the black border. The
+   overlay is generated on the fourth click.
+
+Both images are warped onto the plane as independent layers, each on a grid
+sized to its own resolution rather than the atlas's 25 micron voxel grid, so
+fine detail in the zoom survives. **Layers** reveals the visibility toggles and
+opacity sliders; **Panel** collapses the region list to widen the view;
+**Done** or `Q` finishes.
+
+Everything can also be supplied up front to skip the dialogs:
+
+```bash
+python src/microprism_atlas_mapper.py /path/to/project \
+  --two-photon-image /path/to/unzoomed.tif \
+  --two-photon-zoom-image /path/to/zoomed.tif \
+  --two-photon-magnification 2
+```
+
+`--two-photon-render-scale` oversamples the warped layers beyond their native
+resolution, and `--two-photon-opacity` / `--two-photon-zoom-opacity` set the
+starting opacity of each layer.
+
+Alongside the region summaries, the mapper writes
+`microprism_atlas_plane_2p_alignment.json` containing the magnification, scale
+factor, translation (in both 0-based and 1-based pixel conventions), all three
+transform matrices, and the alignment quality score, so the alignment never has
+to be redone by hand. A matching `_2p_alignment.png` records how it was aligned,
+and `_2p_overlay.png` shows the result on the atlas plane.
+
+The interactive viewer starts centred on the prism. Scroll or use `+`/`-` to
+zoom, `Fit` or `0` for the whole slice, and `R` to reset. `In-plane`, `Coronal`,
+`Sagittal` and `Axial` switch perspective, and the active one is highlighted.
+Drag or use the arrow keys to pan. `G` toggles atlas colours, `L` the corner
+labels, `F` the prism fill, `T` the two-photon overlay. The Allen average
+template is displayed beneath translucent annotation colours; `--no-template`
+gives the label-only view. `?` prints the full control list. The complete
+calculation is documented in `docs/microprism_atlas_mapping.md`.
 
 ---
 
@@ -657,9 +766,26 @@ bioRxiv 2025.12.23.696162; doi: https://doi.org/10.64898/2025.12.23.696162
 Sakata, S. mfaCTpy: Python-based package for multi-fiber array tracing based on microCT images
 https://github.com/Sakata-Lab/mfaCTpy
 ```
+
+The microprism extensions in this fork are not part of that publication. If you
+use them, please cite the original work above and link to this repository.
 ---
 
 ## Version History
+
+### Microprism fork
+
+- **2026**: Two-photon mapping onto the prism face
+  - Zoomed-image alignment over the unzoomed image, with saved scale and translation
+  - Dedicated render grids so overlays keep their native resolution
+  - Alignment scoring against the image data
+  - Rebuilt viewer interface with contextual controls and an instruction banner
+- **2026**: Microprism imaging-plane pipeline
+  - Corner tracker for the prism imaging face
+  - Atlas mapper for the oblique imaging plane
+  - 3D registration quality control
+
+### Upstream (Sakata-Lab/mfaCTpy)
 
 - **v1.1** (2025): Updated documentation
   - Accurate module descriptions
