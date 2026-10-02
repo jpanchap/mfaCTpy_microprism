@@ -3,15 +3,23 @@
 > **This is a modified fork.** The original is
 > [Sakata-Lab/mfaCTpy](https://github.com/Sakata-Lab/mfaCTpy), which registers
 > microCT mouse brain volumes to the Allen CCF and traces implanted multi-fiber
-> arrays. This fork adapts that pipeline for **microprism imaging**: locating
-> the prism's imaging face inside the mouse brain, and mapping two-photon images onto
-> that face so individual cells can be assigned to Allen atlas regions.
+> arrays. This fork adapts that pipeline for **microprism imaging**. Rather
+> than tracking fibers, it locates the prism's imaging face inside the mouse
+> brain, maps two-photon images onto that face, and determines each cell's
+> coordinates relative to the imaging plane within the Allen atlas.
 >
-> Modified by Jyothi and Dr. Adam Gordon-Fennell (Stuber Lab, University of Washington). Distributed under
-> GPL v3, the same licence as the original. See
+> Modified by Jyothi Panchapagesan and Dr. Adam Gordon-Fennell (Stuber Lab, University of
+> Washington). Distributed under GPL v3, the same licence as the original. See
 > [What this fork adds](#what-this-fork-adds) for the full list of changes.
 >
 > Upstream also has a newer version: https://github.com/Sakata-Lab/mfaCTpy2
+
+## Status
+
+Active development. The registration and microprism mapping stages are working
+and in regular use; the per-cell export is not yet built.
+
+---
 
 ## User Guide v1.1 (microprism fork)
 
@@ -33,7 +41,15 @@
 
 ## Overview
 
-**mfaCTpy** is a Python package for registering microCT-scanned mouse brain images to the Allen Common Coordinate Framework (CCF). It provides a complete workflow for processing microCT data with implanted optical fibers, enabling automated fiber tracking and brain region identification.
+**mfaCTpy** is a Python package for registering microCT-scanned mouse brain
+images to the Allen Common Coordinate Framework (CCF). It provides a complete
+workflow for processing microCT data with implanted optical devices, resolving
+their position in the brain and identifying the regions they reach.
+
+**This fork extends that workflow to microprism imaging.** The registration
+stages are shared, but instead of tracing implanted fibers it locates the
+prism's imaging face, maps two-photon images onto that face, and resolves the
+position of individual cells in Allen atlas coordinates.
 
 ### Key Features
 
@@ -41,15 +57,19 @@
 - Interactive midline alignment with axis verification
 - Landmark-based registration to Allen CCF with optional intensity-based refinement
 - Manual fiber tracking with automatic brain region identification
-- Interactive 3D visualization of fiber locations
+- Microprism imaging-face tracking and oblique atlas-plane mapping
+- Two-photon image overlay onto the prism face, with zoomed-image alignment
+- Interactive 3D visualization of implant locations
 - Movie generation for presentations
 - Allen CCF annotation viewer with structure lookup
 
 ### Use Cases
 
 - Identifying brain regions where optical fibers are implanted
+- Locating a microprism's imaging plane within the Allen atlas
+- Assigning two-photon imaged cells to Allen atlas regions
 - Registering microCT mouse brain scans to a standard atlas
-- Visualizing fiber placement in anatomical context
+- Visualizing implant placement in anatomical context
 - Creating presentation materials from 3D brain volumes
 
 ---
@@ -58,7 +78,7 @@
 
 The original pipeline answers one question: *where are the implanted fibers, and
 which brain regions do they sit in?* This fork answers a different one: *where
-exactly is the microprism's imaging face inside the brain, and where does each
+is the microprism's imaging face inside the brain, and where does each
 cell I can see through it actually live?*
 
 Everything upstream is unchanged in purpose and still required. DICOM
@@ -69,12 +89,11 @@ exactly as before; the microprism work sits on top of a registered volume.
 
 | File | What it does |
 | --- | --- |
-| `microprism_corner_tracker.py` | Interactively mark the physical prism corners in the microCT volume. Derives the two missing corners of the imaging face and writes `microprism_corners.json`. |
+| `microprism_corner_tracker.py` | Interactively mark the physical prism corners in the microCT volume. Derives the two top corners of the imaging face and writes `microprism_corners.json`. |
 | `microprism_atlas_mapper.py` | Transform that face into Allen CCF space, sample the atlas along it, report the regions it crosses, and overlay two-photon images onto it. |
-| `microprism_registration_qc_3d.py` | 3D quality-control view of the microprism-to-Allen registration. |
-| `microprism_v2.py` | Earlier standalone revision of the corner tracker, kept for reference. |
-| `allen_ccf_resources.py` | Downloads and caches the Allen annotation volume, average template and ontology. |
-| `project_paths.py` | Shared project-path resolution for the command-line scripts. |
+| `allen_ccf_resources.py` | Downloads and caches the Allen annotation volume, average template and ontology. Required by the atlas mapper. |
+| `project_paths.py` | Shared project-path resolution. Required by both scripts. |
+| `assets/microprism_guide.png` | Reference figure the corner tracker displays while you mark corners. |
 
 ### Modified upstream modules
 
@@ -92,16 +111,76 @@ steps, each documented in `docs/microprism_atlas_mapping.md`:
    the unzoomed field, so this is scale and translation only. The scale comes
    from the magnification you enter; the translation comes from dragging the
    zoom into place. Both are saved.
-2. **Unzoomed image to the prism face.** The prism sits at an angle in the
-   brain, so its square face photographs as a tilted quadrilateral. Clicking
-   four corners determines a projective transform (a homography), which handles
-   rotation and perspective as well as scale and position.
+2. **Unzoomed image to the prism face.** Clicking four corners determines a
+   **similarity transform** — uniform scale, rotation, translation and a
+   mirror. See [Choosing the transform model](#choosing-the-transform-model)
+   for why this rather than a homography.
 3. **Prism face to the Allen CCF.** The face's position in atlas space is
    already known from the corner tracker and registration, so a position in
    millimetres on the face becomes an X, Y, Z voxel and hence a region.
 
 Because all three are linear maps on homogeneous coordinates, they compose into
 a single matrix, so each cell is transformed in one step rather than three.
+
+### Choosing the transform model
+
+The 2p imaging plane is parallel to the prism face, and a microscope objective
+is telecentric in object space. Together those mean the projection is
+**orthographic**: there is no finite-distance projection centre, so no
+perspective can arise. Even a tilted object plane would foreshorten — an
+anisotropic scale — rather than converge. A projective transform's two
+perspective parameters therefore model something that cannot physically occur
+in this optical path.
+
+That leaves three candidates, and the question is how many degrees of freedom
+are justified by four corner correspondences:
+
+| model | free parameters | what it adds |
+| --- | --- | --- |
+| similarity | 4 + mirror | uniform scale, rotation, translation, reflection |
+| affine | 6 | anisotropic scale and shear |
+| projective | 8 | perspective |
+
+Simulation, with a 1.5 mm face, 512 px frames, 3 px corner-click error and one
+Allen voxel of error on the tracked corners, measuring how far interior points
+land from truth:
+
+| true geometry | similarity | affine | projective |
+| --- | --- | --- | --- |
+| pure similarity | **21.5 µm** | 24.3 µm | 28.8 µm |
+| 1% anisotropic scan | **21.5 µm** | 24.1 µm | 28.5 µm |
+| 3% anisotropic scan | **23.8 µm** | 24.6 µm | 28.4 µm |
+| one corner mis-clicked 15 px | **28.5 µm** | 31.9 µm | 37.8 µm |
+
+Similarity wins even when the truth *is* anisotropic, because with only four
+correspondences the extra parameters cost more in fitted noise than they
+recover. Affine does not overtake it until the anisotropy exceeds roughly 5%,
+far beyond any plausible scan miscalibration. Projective is worst everywhere,
+and degrades fastest when a corner is mis-clicked.
+
+**The residual is the other reason.** A projective fit has eight free
+parameters for eight numbers, so it passes through all four corners exactly and
+its residual is always zero — it can never tell you whether the corner tracking
+or the atlas registration was any good. A similarity leaves what it cannot
+absorb visible, and in simulation that leftover tracks the true interior error
+closely enough to read as an accuracy estimate. The mapper prints all three
+models' residuals on every run and records them in the alignment JSON, so
+upstream quality is auditable rather than assumed.
+
+Reflection is fitted explicitly, not assumed away: the prism's mirrored
+hypotenuse flips handedness, and a rotation-only fit cannot express that.
+
+Because a similarity cannot match all four corners exactly, the 2p image will
+no longer sit flush inside the red prism outline. That gap is your measurement
+error made visible, not a regression. See
+[reading the corner gap](#the-2p-image-does-not-line-up-exactly-with-the-prism-outline)
+for how to read it.
+
+`--two-photon-fit-model` selects the model and `--two-photon-fit-target`
+chooses whether to fit against the corners as tracked (`measured`, the default,
+which keeps upstream error visible in the residual) or the rectangle they imply
+(`rectified`, more accurate when the prism aspect ratio was entered correctly
+in the tracker).
 
 ---
 
@@ -194,7 +273,7 @@ Once downloaded, the same files are reused for all datasets.
 | `landmark_registration.py` | Register to CCF | Landmark selection, affine transform, refinement |
 | `fiber_tracker.py` | Track optical fibers | Manual tracking, CCF region lookup |
 | `microprism_corner_tracker.py` | Track a microprism face | Four-corner marking and imaging-face derivation |
-| `microprism_atlas_mapper.py` | Map a microprism face to CCF | Full-plane region sampling and labeled atlas map |
+| `microprism_atlas_mapper.py` | Map a microprism face to CCF | Full-plane region sampling, labeled atlas map, two-photon overlay |
 | `fiber_visualizer_3d.py` | 3D visualization | Interactive 3D view, slice planes |
 | `movie_creator.py` | Create MP4 movies | GUI-based, multiple axes |
 | `annotation_loader.py` | View CCF annotations | Interactive browser, structure colors |
@@ -484,7 +563,15 @@ python src/microprism_atlas_mapper.py /path/to/project \
 
 `--two-photon-render-scale` oversamples the warped layers beyond their native
 resolution, and `--two-photon-opacity` / `--two-photon-zoom-opacity` set the
-starting opacity of each layer.
+starting opacity of each layer. `--two-photon-fit-model` and
+`--two-photon-fit-target` control the corner fit, as described in
+[Choosing the transform model](#choosing-the-transform-model).
+
+After the fourth corner click the mapper prints a comparison of all three
+transform models with their corner residuals, and flags a warning if the
+residual of the chosen model exceeds 150 µm — which usually means the corners
+were clicked out of order, or the prism tracking or registration needs
+revisiting.
 
 Alongside the region summaries, the mapper writes
 `microprism_atlas_plane_2p_alignment.json` containing the magnification, scale
@@ -656,6 +743,52 @@ python annotation_loader.py
 
 ---
 
+### The 2p image does not line up exactly with the prism outline
+
+**A small gap is expected and correct.** The corner fit uses a similarity
+transform, which has four free parameters against eight numbers from your four
+corners, so it cannot bend to match all of them. What it cannot absorb is left
+over and visible. The previous projective fit always snapped the image onto the
+outline exactly, because it had enough free parameters to hide any amount of
+error — the gap is not new error, it is error that was always there.
+
+The script prints the leftover error in microns after the fourth corner click.
+As a guide: **under 25 µm** is excellent (below one Allen voxel), **25–75 µm**
+is normal, **75–150 µm** is usable but worth checking, and **above 150 µm**
+triggers a warning.
+
+**The shape of the gap tells you the cause:**
+
+| What you see | What it means |
+| --- | --- |
+| Even gap all round, image slightly too small or too large, shape otherwise right | Scale error. The black border you are clicking is not quite the physical face edge, or the prism dimensions entered in the tracker are wrong. |
+| Two corners fit well, two are off; the image looks squeezed into a non-rectangle | The tracked prism face is not a rectangle. Comes from microCT corner-click error or skew in the landmark registration. The most common cause. |
+| One corner badly off, the other three fine | That corner was mis-clicked, in the 2p image or in the microCT. Redo it. |
+| The image is visibly rotated relative to the outline | Corner order is wrong. Rotation is a free parameter, so any genuine rotation is absorbed by the fit; a visible one means D1/D2/P1/P2 were assigned to the wrong corners. |
+| The image looks mirrored | Corner order reversed. The mapper prints a mirror warning when it detects this. |
+| Small, roughly equal gaps at all four corners | Normal accumulated measurement error. Nothing is wrong. |
+
+**Where the error comes from,** roughly in increasing order of contribution:
+your 2p corner clicks (a few pixels, around 10 µm); the black border not being
+exactly the face edge (systematic); clicking the prism corners in the microCT
+(one or two 25 µm voxels, since CT edges are blurry); the derived D1 and D2
+corners, which are computed from the prism dimensions rather than clicked, so
+wrong dimensions displace them systematically; the microCT-to-Allen landmark
+registration, usually the largest single contributor; and any brain movement
+between the microCT scan and the 2p session.
+
+**What the residual cannot tell you.** It measures whether your 2p corners and
+your tracked prism corners agree with *each other*. It cannot detect error they
+share. If the whole prism is registered 300 µm too far anterior, all four
+corners are wrong by the same amount in the same direction, the fit is clean,
+the residual is small — and every mapped cell is still 300 µm out. Checking
+that the prism is in the right place in the brain is a separate question,
+answered by the landmark registration error reported in Step 4 and by checking
+the prism outline against the coronal, sagittal and axial views, not by this
+number. Both matter, and they catch different failures.
+
+---
+
 ## Tips for Best Results
 
 ### Imaging Tips
@@ -775,6 +908,11 @@ use them, please cite the original work above and link to this repository.
 
 ### Microprism fork
 
+- **2026**: Similarity transform for the 2p corner fit
+  - Replaces the projective fit, which modelled perspective that cannot occur
+    under orthographic microscope optics
+  - Corner residuals now give a real accuracy estimate and surface upstream error
+  - `--two-photon-fit-model` and `--two-photon-fit-target` for comparison
 - **2026**: Two-photon mapping onto the prism face
   - Zoomed-image alignment over the unzoomed image, with saved scale and translation
   - Dedicated render grids so overlays keep their native resolution
