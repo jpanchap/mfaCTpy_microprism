@@ -6,3 +6,22 @@ __pycache__/
 resources/allen_ccf/*.nrrd
 resources/allen_ccf/structure_tree.json
 resources/allen_ccf/*.part
+
+# Local development scripts, not part of the published pipeline
+src/microprism_v2.py
+src/microprism_registration_qc_3d.py
+
+# Script outputs and working notes
+outputs/
+Claude outputs/
+
+# Imaging data is never committed
+*.tif
+*.tiff
+*.dcm
+*.nii
+*.nii.gz
+*.npy
+*.mat
+*.h5
+*.hdf5

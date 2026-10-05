@@ -24,6 +24,6 @@ def resolve_project_path(project_path: str | Path | None = None) -> Path:
     raise FileNotFoundError(
         "Could not find a project folder from the current location.\n"
         "Please cd into the project folder, for example:\n"
-        "  cd /Users/jojop/microPrismRegistration/stuber-lab/testA\n"
+        "  cd /path/to/your/project\n"
         "Then run the script again."
     )

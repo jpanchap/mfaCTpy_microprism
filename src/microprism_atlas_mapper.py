@@ -1283,6 +1283,174 @@ def solve_projective_transform(
     return homography
 
 
+def solve_similarity_transform(
+    source_xy: np.ndarray,
+    target_uv: np.ndarray,
+) -> np.ndarray:
+    """Least-squares similarity: uniform scale, rotation, translation, mirror.
+
+    This is the physically correct model for mapping 2p pixels onto the prism
+    face. The 2p imaging plane is parallel to the face, and a microscope
+    objective is telecentric in object space, so the projection is orthographic
+    and no perspective term can arise. Uniform scale follows from the scan
+    being isotropic; rotation from the prism's arbitrary orientation relative
+    to the scan axes.
+
+    Reflection is allowed and chosen by lowest residual, because the prism's
+    mirrored hypotenuse flips handedness. A rotation-only fit cannot express
+    that and would silently converge on a wrong solution.
+
+    Solved in the complex plane: a similarity is w = a*z + b, or
+    w = a*conj(z) + b when reflected, and both have closed-form least squares.
+    Returned as a 3x3 so it is interchangeable with the other fits.
+    """
+    source_xy = np.asarray(source_xy, dtype=float)
+    target_uv = np.asarray(target_uv, dtype=float)
+    if source_xy.shape != target_uv.shape or source_xy.shape[0] < 2:
+        raise ValueError("Similarity fitting needs matched point sets of >= 2.")
+    z = source_xy[:, 0] + 1j * source_xy[:, 1]
+    w = target_uv[:, 0] + 1j * target_uv[:, 1]
+    best_matrix, best_error = None, np.inf
+    for reflect in (False, True):
+        basis = np.conj(z) if reflect else z
+        centred = basis - basis.mean()
+        denominator = float((np.abs(centred) ** 2).sum())
+        if denominator <= 1e-12:
+            continue
+        scale_rotation = (np.conj(centred) @ (w - w.mean())) / denominator
+        offset = w.mean() - scale_rotation * basis.mean()
+        error = float(np.abs(scale_rotation * basis + offset - w).sum())
+        if error < best_error:
+            p, q = float(scale_rotation.real), float(scale_rotation.imag)
+            bx, by = float(offset.real), float(offset.imag)
+            best_matrix = (
+                np.array([[p, q, bx], [q, -p, by], [0.0, 0.0, 1.0]])
+                if reflect else
+                np.array([[p, -q, bx], [q, p, by], [0.0, 0.0, 1.0]])
+            )
+            best_error = error
+    if best_matrix is None or abs(float(np.linalg.det(best_matrix))) < 1e-12:
+        raise ValueError(
+            "2p similarity fit is degenerate; reselect distinct corners."
+        )
+    return best_matrix
+
+
+def solve_affine_transform(
+    source_xy: np.ndarray,
+    target_uv: np.ndarray,
+) -> np.ndarray:
+    """Least-squares affine: adds anisotropic scale and shear to a similarity.
+
+    Worth having when the scan axes are calibrated differently from one
+    another, but with only four correspondences the two extra parameters cost
+    more in fitted noise than they recover unless the anisotropy exceeds
+    roughly 5 percent.
+    """
+    source_xy = np.asarray(source_xy, dtype=float)
+    target_uv = np.asarray(target_uv, dtype=float)
+    if source_xy.shape != target_uv.shape or source_xy.shape[0] < 3:
+        raise ValueError("Affine fitting needs matched point sets of >= 3.")
+    rows, values = [], []
+    for (x, y), (u, v) in zip(source_xy, target_uv):
+        rows.append([x, y, 1.0, 0.0, 0.0, 0.0])
+        values.append(u)
+        rows.append([0.0, 0.0, 0.0, x, y, 1.0])
+        values.append(v)
+    params, *_ = np.linalg.lstsq(
+        np.asarray(rows), np.asarray(values), rcond=None
+    )
+    matrix = np.array([
+        [params[0], params[1], params[2]],
+        [params[3], params[4], params[5]],
+        [0.0, 0.0, 1.0],
+    ], dtype=float)
+    if abs(float(np.linalg.det(matrix))) < 1e-12:
+        raise ValueError("2p affine fit is degenerate; reselect corners.")
+    return matrix
+
+
+TWO_PHOTON_FIT_SOLVERS = {
+    "similarity": (solve_similarity_transform, 4),
+    "affine": (solve_affine_transform, 6),
+    "projective": (solve_projective_transform, 8),
+}
+
+
+def compare_two_photon_fits(
+    source_xy: np.ndarray,
+    target_uv: np.ndarray,
+) -> dict[str, Any]:
+    """Fit every candidate model and measure how far each misses the corners.
+
+    The residual is the diagnostic that matters. A projective fit has eight
+    free parameters for eight numbers, so it passes through all four corners
+    exactly and its residual is always zero: it can never tell you whether the
+    corner tracking or the registration was any good. A similarity has four,
+    so what it cannot absorb is left over and visible, and in simulation that
+    leftover tracks the true interior error closely enough to read as an
+    accuracy estimate.
+    """
+    source_xy = np.asarray(source_xy, dtype=float)
+    target_uv = np.asarray(target_uv, dtype=float)
+    report: dict[str, Any] = {}
+    for name, (solver, dof) in TWO_PHOTON_FIT_SOLVERS.items():
+        try:
+            matrix = solver(source_xy, target_uv)
+        except (np.linalg.LinAlgError, ValueError) as error:
+            report[name] = {"available": False, "reason": str(error)}
+            continue
+        residuals = np.linalg.norm(
+            apply_projective_transform(source_xy, matrix) - target_uv, axis=1
+        )
+        report[name] = {
+            "available": True,
+            "matrix": matrix,
+            "degrees_of_freedom": dof,
+            "residuals_um": [float(r * 1000.0) for r in residuals],
+            "rms_residual_um": float(np.sqrt((residuals ** 2).mean()) * 1000.0),
+            "max_residual_um": float(residuals.max() * 1000.0),
+        }
+    return report
+
+
+def print_two_photon_fit_report(
+    report: dict[str, Any],
+    chosen: str,
+    corner_labels: tuple[str, ...] = ("D1", "D2", "P1", "P2"),
+) -> None:
+    """Report how far the fitted transform misses each clicked corner.
+
+    Only the model actually used is printed. The alternatives are still
+    computed and recorded in the alignment JSON, but showing them every run
+    adds noise: a projective fit has as many free parameters as there are
+    numbers to match, so its residual is zero on every run by construction.
+
+    Per-corner values are the useful part. A single large value points at one
+    mis-clicked corner; several similar large values point at the prism
+    tracking or the atlas registration.
+    """
+    entry = report.get(chosen, {})
+    if not entry.get("available"):
+        print(f"\n2p corner fit ({chosen}): unavailable - {entry.get('reason')}")
+        return
+    residuals = entry["residuals_um"]
+    print(
+        f"\n2p corner fit: {chosen}, "
+        f"{entry['degrees_of_freedom']} free parameters"
+    )
+    for label, value in zip(corner_labels, residuals):
+        print(f"    {label}  {value:7.1f} um")
+    rms = entry["rms_residual_um"]
+    print(f"    RMS {rms:7.1f} um  (estimated accuracy of this mapping)")
+    if rms > 150.0:
+        print(
+            "    WARNING: large. Check the corner order (D1, D2, P1, P2), the "
+            "prism\n    tracking, and the microCT-to-atlas registration before "
+            "trusting cell positions."
+        )
+
+
 def apply_projective_transform(points_xy: np.ndarray, homography: np.ndarray) -> np.ndarray:
     points_xy = np.asarray(points_xy, dtype=float)
     homogeneous = np.concatenate(
@@ -1832,6 +2000,9 @@ def render_plane_map(
     two_photon_magnification: float | None = None,
     two_photon_zoom_opacity: float = TWO_PHOTON_ZOOM_OVERLAY_ALPHA,
     two_photon_render_scale: float = 1.0,
+    two_photon_fit_model: str = "similarity",
+    two_photon_fit_target: str = "measured",
+    two_photon_rectified_uv_mm: np.ndarray | None = None,
 ) -> None:
     face_order = ("bottom_left", "bottom_right", "top_right", "top_left")
     corner_by_key = {row["corner_key"]: row for row in corner_rows}
@@ -2018,6 +2189,8 @@ def render_plane_map(
         "two_photon_warped_extent": None,
         "two_photon_zoom_warped_extent": None,
         "two_photon_render_scale": max(float(two_photon_render_scale), 0.05),
+        "two_photon_fit_model": str(two_photon_fit_model),
+        "two_photon_fit_target": str(two_photon_fit_target),
         "context_group": None,
         "show_region_panel": True,
         "show_two_photon_zoom": True,
@@ -2771,14 +2944,37 @@ def render_plane_map(
         for label, point in zip(("D1", "D2", "P1", "P2"), source_points):
             print(f"  2p {label}: x={point[0]:.3f}, y={point[1]:.3f} px")
         render_scale = state["two_photon_render_scale"]
-        face_polygon = two_photon_target_uv_mm[[0, 1, 3, 2]]
-        try:
-            homography = solve_projective_transform(
-                source_points, two_photon_target_uv_mm
+        fit_model = state["two_photon_fit_model"]
+        if fit_model not in TWO_PHOTON_FIT_SOLVERS:
+            print(f"Unknown 2p fit model {fit_model!r}; using similarity.")
+            fit_model = "similarity"
+        # The target is either the corners as actually tracked, or the
+        # rectangle they imply. The measured quadrilateral keeps upstream
+        # error visible in the residual; the rectified one is more accurate
+        # if the prism aspect ratio was entered correctly.
+        fit_target_points = two_photon_target_uv_mm
+        if (
+            state["two_photon_fit_target"] == "rectified"
+            and two_photon_rectified_uv_mm is not None
+        ):
+            fit_target_points = np.asarray(
+                two_photon_rectified_uv_mm, dtype=float
             )
+        face_polygon = fit_target_points[[0, 1, 3, 2]]
+        fit_report = compare_two_photon_fits(
+            source_points, fit_target_points
+        )
+        print_two_photon_fit_report(fit_report, fit_model)
+        try:
+            chosen = fit_report.get(fit_model, {})
+            if not chosen.get("available"):
+                raise ValueError(
+                    chosen.get("reason", f"{fit_model} fit unavailable")
+                )
+            homography = chosen["matrix"]
             inverse = np.linalg.inv(homography)
             wide_extent, wide_shape, wide_pitch = plane_render_grid(
-                two_photon_target_uv_mm,
+                fit_target_points,
                 two_photon_image.shape[:2],
                 render_scale,
             )
@@ -2868,6 +3064,16 @@ def render_plane_map(
                             "prism_face_corners_uv_mm":
                                 two_photon_target_uv_mm.tolist(),
                             "atlas_spacing_mm": float(atlas_spacing_mm),
+                            "fit_model": fit_model,
+                            "fit_target": state["two_photon_fit_target"],
+                            "fit_comparison": {
+                                name: {
+                                    key: value
+                                    for key, value in entry.items()
+                                    if key != "matrix"
+                                }
+                                for name, entry in fit_report.items()
+                            },
                         },
                     )
                     print(
@@ -4109,6 +4315,31 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--two-photon-fit-model",
+        choices=("similarity", "affine", "projective"),
+        default="similarity",
+        help=(
+            "Transform mapping 2p pixels onto the prism face. The imaging "
+            "plane is parallel to the face and microscope optics are "
+            "telecentric, so the projection is orthographic and a "
+            "similarity (scale, rotation, translation, mirror) is the "
+            "physically correct model. Affine adds anisotropic scale and "
+            "shear; projective adds perspective that cannot occur here and "
+            "leaves no residual to judge the fit by."
+        ),
+    )
+    parser.add_argument(
+        "--two-photon-fit-target",
+        choices=("measured", "rectified"),
+        default="measured",
+        help=(
+            "Fit against the prism corners as tracked (measured), which "
+            "keeps upstream error visible in the residual, or against the "
+            "rectangle they imply (rectified), which is more accurate when "
+            "the prism aspect ratio was entered correctly in the tracker."
+        ),
+    )
+    parser.add_argument(
         "--two-photon-render-scale",
         type=float,
         default=1.0,
@@ -4458,6 +4689,12 @@ def main() -> None:
         float(args.two_photon_magnification),
         float(np.clip(args.two_photon_zoom_opacity, 0.0, 1.0)),
         max(float(args.two_photon_render_scale), 0.05),
+        args.two_photon_fit_model,
+        args.two_photon_fit_target,
+        np.stack([
+            geometry.face_uv["top_left"], geometry.face_uv["top_right"],
+            geometry.face_uv["bottom_left"], geometry.face_uv["bottom_right"],
+        ]) * atlas_spacing_for_display,
     )
     print_summary(corner_rows, face_summary)
     print(f"CSV summary: {summary_path}")
