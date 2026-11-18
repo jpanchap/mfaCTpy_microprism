@@ -28,9 +28,6 @@ OUTPUT
 Keyboard: C/S/A switch views · arrows/scroll navigate · +/- zoom · O overlays
           U undo · Enter save
 
-UI update: larger brain image panel, added bottom padding, and comments/docstrings.
-
-TODO: Update PRISM_EDGE_MM once confirmed by postdoc.
 Dependencies: pip install numpy tifffile matplotlib
 """
 
@@ -403,7 +400,7 @@ class MicroprismCornerTracker:
             mapping.close()
 
     # ─────────────────────────────────────────────────────────────────────
-    # UI BUILD — matches postdoc / midline_alignment.py style
+    # UI BUILD —
     # Light background, wheat info box, standard matplotlib colors
     # ─────────────────────────────────────────────────────────────────────
 
