@@ -1,5 +1,7 @@
 """Shared project path helpers for command-line scripts."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 

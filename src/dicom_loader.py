@@ -3,6 +3,8 @@ DICOM Volume Loader for MicroCT Mouse Brain Data
 Loads a series of DICOM files from a folder and converts to 3D numpy array
 """
 
+from __future__ import annotations
+
 import numpy as np
 import pydicom
 from pathlib import Path
@@ -17,14 +19,14 @@ import json
 def load_dicom_volume(dicom_folder: str, normalize: bool = True) -> Tuple[np.ndarray, dict]:
     """
     Load DICOM series from a folder into a 3D volume.
-    
+
     Parameters:
     -----------
     dicom_folder : str
         Path to folder containing DICOM (.dcm) files
     normalize : bool
         If True, normalize volume to [0, 1] range
-        
+
     Returns:
     --------
     volume : np.ndarray
@@ -32,34 +34,34 @@ def load_dicom_volume(dicom_folder: str, normalize: bool = True) -> Tuple[np.nda
     metadata : dict
         Dictionary containing DICOM metadata
     """
-    
+
     dicom_folder = Path(dicom_folder)
-    
+
     if not dicom_folder.exists():
         raise FileNotFoundError(f"Directory not found: {dicom_folder}")
-    
+
     # Find all DICOM files
     dcm_files = sorted(glob.glob(str(dicom_folder / "*.dcm")))
-    
+
     if len(dcm_files) == 0:
         raise ValueError(f"No DICOM files found in {dicom_folder}")
-    
+
     print(f"Loading {len(dcm_files)} DICOM files from: {dicom_folder}")
-    
+
     # Read first file to get dimensions
     first_slice = pydicom.dcmread(dcm_files[0])
     img_shape = first_slice.pixel_array.shape
-    
+
     # Initialize volume as (Z, Y, X), which is the convention used by the
     # alignment and registration scripts.
     volume = np.zeros((len(dcm_files), img_shape[0], img_shape[1]), dtype=np.float64)
-    
+
     # Load all slices
     metadata = {}
     for i, dcm_file in enumerate(tqdm(dcm_files, desc="Loading DICOM slices")):
         ds = pydicom.dcmread(dcm_file)
         volume[i, :, :] = ds.pixel_array.astype(np.float64)
-        
+
         # Store metadata from first slice
         if i == 0:
             metadata = {
@@ -72,16 +74,16 @@ def load_dicom_volume(dicom_folder: str, normalize: bool = True) -> Tuple[np.nda
                 'Columns': ds.Columns,
                 'NumberOfSlices': len(dcm_files)
             }
-    
+
     # Normalize if requested
     if normalize:
         volume = volume / np.max(volume)
-    
+
     print(
         "Volume loaded successfully. Dimensions (Z, Y, X): "
         f"{volume.shape[0]} x {volume.shape[1]} x {volume.shape[2]}"
     )
-    
+
     return volume, metadata
 
 
@@ -137,7 +139,7 @@ def write_metadata_sidecar(metadata: dict, output_path: str | Path) -> None:
             "NumberOfSlices": metadata.get("NumberOfSlices"),
         },
     }
-    with open(sidecar_path, "w") as f:
+    with open(sidecar_path, "w", encoding="utf-8") as f:
         json.dump(sidecar, f, indent=2)
     print(f"Metadata sidecar saved to: {sidecar_path}")
 
@@ -145,7 +147,7 @@ def write_metadata_sidecar(metadata: dict, output_path: str | Path) -> None:
 def save_volume_as_tif(volume: np.ndarray, output_path: str, bit_depth: int = 16):
     """
     Save 3D volume as multi-page TIFF file.
-    
+
     Parameters:
     -----------
     volume : np.ndarray
@@ -156,17 +158,17 @@ def save_volume_as_tif(volume: np.ndarray, output_path: str, bit_depth: int = 16
         Bit depth for output (8 or 16)
     """
     from tifffile import imwrite
-    
+
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     if bit_depth == 16:
         volume_out = (volume * 65535).astype(np.uint16)
     elif bit_depth == 8:
         volume_out = (volume * 255).astype(np.uint8)
     else:
         raise ValueError("bit_depth must be 8 or 16")
-    
+
     print(f"Saving volume to: {output_path}")
     imwrite(output_path, volume_out, compression='none')
     print(f"Successfully saved {volume_out.shape[0]} slices")

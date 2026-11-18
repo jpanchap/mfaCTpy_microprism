@@ -85,6 +85,8 @@ UI_BUTTON_KINDS = {
 }
 DEFAULT_ZOOM_MAGNIFICATION = 2.0
 MAX_TWO_PHOTON_RENDER_PX = 2048
+from prism_ui_help import guide_location
+
 CONTROLS_HELP = (
     "Viewer controls\n"
     "  Views      In-plane/I, Coronal/C, Sagittal/S, Axial/A\n"
@@ -106,6 +108,7 @@ CONTROLS_HELP = (
     "scroll the panel to change slice"
 )
 
+CONTROLS_HELP += f"\nComplete controls and visual reference: {guide_location()}\n"
 
 def style_button(button: Button, kind: str) -> None:
     """Re-skin an existing button, used to mark the active view."""
@@ -496,10 +499,32 @@ def point_xyz(point: dict[str, Any], label: str) -> np.ndarray:
         raise ValueError(f"Invalid or missing coordinates for {label}") from exc
 
 
-def load_face_corners(path: Path) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+def load_face_corners(path: Path, method: str = "selected", branch: str | None = None) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     with path.open("r", encoding="utf-8") as stream:
         tracker_data = json.load(stream)
-    face = tracker_data.get("imaging_face_points") or {}
+    if method == "selected":
+        method = tracker_data.get("selected_method", "original")
+    methods = tracker_data.get("derivation_methods", {})
+    if methods:
+        if method not in methods:
+            raise ValueError(f"No saved {method} derivation.")
+        entry = methods[method]
+        if method == "fixed":
+            chosen = branch or entry.get("selected_branch")
+            if not chosen or chosen not in entry.get("candidates", {}):
+                raise ValueError("Fixed fit needs an explicit A/B orientation selection in the tracker (or --fixed-branch).")
+            face = entry["candidates"][chosen]
+            tracker_data["mapped_branch"] = chosen
+        else:
+            face = entry.get("imaging_face_points") or {}
+        required = ("shared_left_P1", "shared_right_P2", "derived_left", "derived_right")
+        if any(face.get(k) is None for k in required):
+            raise ValueError(f"Incomplete {method} face; cannot mix fitted and raw corners.")
+    elif method == "fixed":
+        raise ValueError("No fixed fit saved. Reopen the tracker with --load-corners and save both methods first.")
+    else:
+        face = tracker_data.get("imaging_face_points") or {}
+    tracker_data["mapped_method"] = method
     clicked = tracker_data.get("blue_clicked_points") or {}
     derived = tracker_data.get("derived_points") or {}
     values = {
@@ -876,8 +901,8 @@ def report_face_geometry(
     print(f"  fourth-corner plane error: {plane_error_mm:.4f} mm")
     print(
         "  sagittal P1-to-dL direction: "
-        f"dY={sagittal_side[0]:.3f} mm, "
-        f"dZ_display={sagittal_side[1]:.3f} mm, "
+        f"horizontal_dZ={sagittal_side[0]:.3f} mm, "
+        f"vertical_minus_dY={sagittal_side[1]:.3f} mm, "
         f"{sagittal_angle_from_vertical:.1f} deg from vertical"
     )
 
@@ -887,6 +912,7 @@ def print_corner_coordinate_table(
     corners_ccf: dict[str, np.ndarray],
     source_spacing_xyz_mm: np.ndarray,
     atlas_spacing_xyz_mm: np.ndarray,
+    method: str = "original",
 ) -> None:
     display_names = {
         "bottom_left": "P1",
@@ -902,7 +928,7 @@ def print_corner_coordinate_table(
     print("-" * 132)
     for key in ("bottom_left", "bottom_right", "top_left", "top_right"):
         name = display_names[key]
-        point_type = "clicked" if key in {"bottom_left", "bottom_right"} else "derived"
+        point_type = "fitted" if method == "fixed" else ("clicked" if key in {"bottom_left", "bottom_right"} else "derived")
         source_vox = corners_source[key]
         source_mm = source_vox * source_spacing_xyz_mm
         ccf_vox = corners_ccf[key]
@@ -925,8 +951,8 @@ def print_axis_projection_guide() -> None:
     print("\nAxis-ordering / projection guide:")
     print("  Stored corner convention: XYZ voxel coordinates; volume arrays are Z,Y,X.")
     print("  Coronal view:  slice index = Z/AP; plotted axes = X horizontal, Y vertical.")
-    print("  Sagittal view: slice index = X/ML; plotted axes = Y horizontal, Z vertical.")
-    print("  Axial view:    slice index = Y/DV; plotted axes = X horizontal, Z vertical.")
+    print("  Sagittal view: slice index = X/ML; plotted axes = Z horizontal, -Y vertical.")
+    print("  Axial view:    slice index = Y/DV; plotted axes = Z horizontal, -X vertical.")
     print("  Quick checks for future axis bugs:")
     print("    - P1-P2 should mainly change along the plotted width axis in each view.")
     print("    - P1-D1 and P2-D2 should project as nearly parallel edges.")
@@ -4429,12 +4455,20 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Minimum width and height of the initial prism-centered view.",
     )
+    parser.add_argument("--method", choices=("selected", "fixed", "original"), default="selected",
+                        help="Use a complete saved derivation; selected uses the tracker choice.")
+    parser.add_argument("--fixed-branch", choices=("A", "B"), help="Explicitly override fixed-fit orientation.")
+    parser.add_argument("--compare-methods", action="store_true",
+                        help="Map both derivations independently and open a comparison with a saved preference.")
     parser.add_argument("--no-show", action="store_true")
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def main(args=None) -> None:
+    args = parse_args() if args is None else args
+    if args.compare_methods:
+        from microprism_comparison import compare_methods
+        return compare_methods(args, main)
     project = resolve_project_path(args.project_path)
     output_dir = (
         Path(args.output).expanduser().resolve()
@@ -4478,8 +4512,8 @@ def main() -> None:
     print(f"CCF template: {template_path or 'disabled'}")
     print(f"Structure tree: {ontology_path}")
 
-    corners_source, tracker_data = load_face_corners(corners_path)
-    print("Using imaging-face corners: P1, P2, dL, dR (derived top points).")
+    corners_source, tracker_data = load_face_corners(corners_path, args.method, args.fixed_branch)
+    print(f"Using {tracker_data['mapped_method']} imaging face: P1, P2, D1, D2.")
     annotation = load_annotation(annotation_path)
     template = load_annotation(template_path) if template_path else None
     if template is not None and template.shape != annotation.shape:
@@ -4575,7 +4609,7 @@ def main() -> None:
             "different image than the registration transform."
         )
     print_corner_coordinate_table(
-        corners_source, corners_ccf, source_spacing_xyz, atlas_spacing_xyz
+        corners_source, corners_ccf, source_spacing_xyz, atlas_spacing_xyz, tracker_data["mapped_method"]
     )
     print_axis_projection_guide()
 
@@ -4629,6 +4663,10 @@ def main() -> None:
         "transform": str(transform_path) if transform_path else None,
         "saved_transform_maps": saved_transform_maps,
         "selected_transform_direction": selected_transform_direction,
+        "derivation_method": tracker_data["mapped_method"],
+        "derivation_branch": tracker_data.get("mapped_branch"),
+        "derivation_diagnostics": tracker_data.get("derivation_methods", {}).get(
+            tracker_data["mapped_method"], {}).get("diagnostics", {}),
         "source_spacing_mm": float(np.mean(source_spacing_xyz)),
         "source_spacing_mm_xyz": source_spacing_xyz.tolist(),
         "atlas_spacing_mm": atlas_spacing_for_display,
@@ -4703,6 +4741,7 @@ def main() -> None:
     print(f"Prism face mask: {mask_path}")
     print(f"3D corner geometry diagnostic: {diagnostic_3d_path}")
     print_validation_note(microct_path, corners_in_bounds)
+    return {"output_dir": str(output_dir), "json_path": str(json_path)}
 
 
 if __name__ == "__main__":

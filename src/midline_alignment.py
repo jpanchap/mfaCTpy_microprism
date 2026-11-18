@@ -15,24 +15,86 @@ import tifffile
 import time
 import shutil
 from project_paths import resolve_project_path
+from alignment_coordinates import save_mapping, swap_mapping, flip_mapping, backup
 
 
-def copy_metadata_sidecar(source_image: Path, output_image: Path) -> None:
+def copy_metadata_sidecar(source_image: Path, output_image: Path, spacing_zyx=None) -> None:
     """Carry image spacing metadata forward when saving derived TIFFs."""
     source_sidecar = source_image.with_suffix(source_image.suffix + ".metadata.json")
     output_sidecar = output_image.with_suffix(output_image.suffix + ".metadata.json")
     if source_sidecar.exists():
-        shutil.copy2(source_sidecar, output_sidecar)
+        if spacing_zyx is None:
+            shutil.copy2(source_sidecar, output_sidecar)
+        else:
+            metadata = json.loads(source_sidecar.read_text(encoding="utf-8"))
+            metadata['spacing_um_zyx'] = list(spacing_zyx)
+            metadata['spacing_um_xyz'] = list(spacing_zyx[::-1])
+            output_sidecar.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         print(f"✓ Metadata sidecar saved to: {output_sidecar}")
+
+
+def midline_points_xyz(observations):
+    """Decode saved view/slice clicks into XYZ voxel coordinates."""
+    points = []
+    for (view, index), clicks in observations.items():
+        for row, col in clicks:
+            if view == 'axial':
+                points.append([col, index, row])
+            elif view == 'coronal':
+                points.append([col, row, index])
+            elif view == 'sagittal':
+                points.append([index, col, row])
+            else:
+                raise ValueError(f'Unknown midline view: {view}')
+    return np.asarray(points, dtype=float).reshape(-1, 3)
+
+
+def plane_in_output(plane_zyx, output_to_input):
+    """Pull a plane equation into the output grid used by the resampler."""
+    return np.asarray(output_to_input).T @ np.asarray(plane_zyx)
+
+
+def draw_midline_intersection(ax, plane_zyx, slice_axis, slice_index, shape):
+    """Draw only the fitted plane's intersection with this displayed slice."""
+    remaining = [i for i in range(3) if i != slice_axis]
+    row_axis, col_axis = remaining
+    a, b = plane_zyx[col_axis], plane_zyx[row_axis]
+    d = plane_zyx[3] + plane_zyx[slice_axis] * slice_index
+    width, height = shape[col_axis], shape[row_axis]
+    tol = 1e-9 * max(1., np.linalg.norm(plane_zyx[:3]))
+    if abs(a) < tol and abs(b) < tol:
+        message = ('Slice lies in fitted midline plane' if abs(d) < tol else
+                   'Fitted midline plane does not intersect this slice')
+        ax.text(.02, .03, message, transform=ax.transAxes, fontsize=8,
+                color='#ffd54f', bbox=dict(facecolor='black', alpha=.65))
+        return
+    hits = []
+    if abs(b) >= tol:
+        for x in (-.5, width - .5):
+            y = -(a*x+d)/b
+            if -.5-tol <= y <= height-.5+tol:
+                hits.append((x, y))
+    if abs(a) >= tol:
+        for y in (-.5, height - .5):
+            x = -(b*y+d)/a
+            if -.5-tol <= x <= width-.5+tol:
+                hits.append((x, y))
+    if len(hits) >= 2:
+        # Duplicate corner intersections must not collapse the line to a point.
+        first, last = max(((p, q) for p in hits for q in hits),
+                          key=lambda pq: np.linalg.norm(np.subtract(*pq)))
+        ax.plot([first[0], last[0]], [first[1], last[1]], color='#ffd54f',
+                linewidth=1.8, label='Calculated midline plane')
+        ax.legend(loc='upper right', fontsize=8)
 
 
 class AxisVerifier:
     """Interactive tool for verifying and correcting axis orientation"""
-    
-    def __init__(self, image, name="MicroCT"):
+
+    def __init__(self, image, name="MicroCT", spacing_zyx=(1., 1., 1.)):
         """
         Initialize axis verifier
-        
+
         Parameters:
         -----------
         image : numpy.ndarray
@@ -43,11 +105,68 @@ class AxisVerifier:
         self.image = image
         self.name = name
         self.corrected_image = image.copy()
-        
+        self.corrected_to_aligned = np.eye(4)
+        self.original_spacing_zyx = np.asarray(spacing_zyx, dtype=float)
+        if (self.original_spacing_zyx.shape != (3,) or
+                not np.all(np.isfinite(self.original_spacing_zyx)) or
+                np.any(self.original_spacing_zyx <= 0)):
+            raise ValueError('Voxel spacings must be three finite positive values.')
+        self.spacing_zyx = self.original_spacing_zyx.copy()
+
+    @staticmethod
+    def fit_viewport(axis, image_shape, spacing_rc, zoom=1.0):
+        """Keep the panel fixed; fit physical image proportions with display padding."""
+        rows, cols = image_shape
+        row_spacing, col_spacing = spacing_rc
+        # Axes dimensions are screen pixels; data coordinates remain voxel indices.
+        axis.set_aspect('auto')
+        box = axis.get_window_extent()
+        panel_ratio = box.width / max(box.height, 1.)
+        physical_width = cols * col_spacing
+        physical_height = rows * row_spacing
+        fitted_width = max(physical_width, physical_height * panel_ratio)
+        fitted_height = fitted_width / panel_ratio
+        half_width = fitted_width / (2. * col_spacing * zoom)
+        half_height = fitted_height / (2. * row_spacing * zoom)
+        cx, cy = (cols - 1.) / 2., (rows - 1.) / 2.
+        axis.set_xlim(cx - half_width, cx + half_width)
+        axis.set_ylim(cy + half_height, cy - half_height)
+        axis.set_axis_on()
+        axis.set_xticks([])
+        axis.set_yticks([])
+        axis.set_facecolor('black')
+        for spine in axis.spines.values():
+            spine.set_visible(False)
+
+    def apply_view_rotation(self, view, degrees):
+        """Apply a clockwise displayed rotation and record output-to-input ZYX."""
+        if not np.isfinite(degrees):
+            raise ValueError('Rotation angle must be finite.')
+        row, col = {'coronal': (1, 2), 'axial': (0, 2),
+                    'sagittal': (0, 1)}[view]
+        radians = np.deg2rad(degrees)
+        c, s = np.cos(radians), np.sin(radians)
+        # Keep exact quarter-turns on the grid, including boundary voxels.
+        c = 0. if abs(c) < 1e-12 else c
+        s = 0. if abs(s) < 1e-12 else s
+        inverse_rotation = np.eye(3)
+        inverse_rotation[np.ix_([row, col], [row, col])] = [[c, -s], [s, c]]
+        scale = np.diag(self.spacing_zyx)
+        matrix = np.linalg.inv(scale) @ inverse_rotation @ scale
+        center = (np.asarray(self.corrected_image.shape) - 1.) / 2.
+        offset = center - matrix @ center
+        corrected = ndimage.affine_transform(
+            self.corrected_image, matrix, offset=offset, order=1,
+            mode='constant', cval=0, prefilter=False)
+        mapping = np.eye(4)
+        mapping[:3, :3], mapping[:3, 3] = matrix, offset
+        self.corrected_image = corrected
+        self.corrected_to_aligned = self.corrected_to_aligned @ mapping
+
     def verify_and_correct_axes(self):
         """
         Interactive interface to verify and correct axis orientation
-        
+
         Returns:
         --------
         corrected_image : numpy.ndarray
@@ -57,7 +176,7 @@ class AxisVerifier:
         print("AXIS ORIENTATION VERIFICATION")
         print("="*70)
         print("\nThis step helps you verify that the axes are correctly labeled.")
-        print("\nExpected orientation after midline alignment:")
+        print("\nChoose the orientation before marking the midline:")
         print("  - CORONAL (front-back): Should show brain from front/back")
         print("  - AXIAL (top-down): Should show brain from top, midline vertical")
         print("  - SAGITTAL (side): Should show brain from the side")
@@ -67,19 +186,19 @@ class AxisVerifier:
         print("  - Rotate a displayed view by a precise angle in degrees")
         print("    Positive values rotate clockwise; negative values rotate counter-clockwise")
         print("="*70 + "\n")
-        
+
         fig = plt.figure(figsize=(18, 13))
-        
+
         # Create subplots for three views
         ax_coronal = plt.axes([0.055, 0.58, 0.25, 0.30])
         ax_axial = plt.axes([0.375, 0.58, 0.25, 0.30])
         ax_sagittal = plt.axes([0.695, 0.58, 0.25, 0.30])
-        
+
         # Create slider axes
         ax_slider_cor = plt.axes([0.10, 0.505, 0.20, 0.02])
         ax_slider_ax = plt.axes([0.40, 0.505, 0.20, 0.02])
         ax_slider_sag = plt.axes([0.70, 0.505, 0.20, 0.02])
-        
+
         # Current slice indices
         slices = {
             'coronal': self.corrected_image.shape[0] // 2,
@@ -90,19 +209,12 @@ class AxisVerifier:
         rotation_preview_view = {'view': None}
 
         def preview_slice(slice_2d, view_name):
-            angle = rotation_angle['degrees']
-            if rotation_preview_view['view'] != view_name or abs(angle) < 1e-6:
-                return slice_2d
-            return ndimage.rotate(
-                slice_2d,
-                -angle,
-                reshape=False,
-                order=1,
-                mode='constant',
-                cval=float(np.min(slice_2d)),
-                prefilter=False,
-            )
-        
+            # Rotations now update the volume when the existing Rotate button is clicked.
+            return slice_2d
+
+        status_text = fig.text(0.5, 0.455, '', ha='center', fontsize=10,
+                               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
         def update_display():
             """Update all three views"""
             # Coronal (through Z axis)
@@ -110,25 +222,25 @@ class AxisVerifier:
             cor_slice = self.corrected_image[slices['coronal'], :, :]
             cor_display = preview_slice(cor_slice, 'coronal')
             ax_coronal.imshow(cor_display, cmap='gray')
-            ax_coronal.axvline(x=cor_display.shape[1]//2, color='green', 
+            ax_coronal.axvline(x=cor_display.shape[1]//2, color='green',
                              linestyle='--', linewidth=1, alpha=0.5)
             ax_coronal.set_title(f'CORONAL (Z={slices["coronal"]})\n'
                                f'Shape: {cor_display.shape} | Front/back | midline vertical',
                                fontsize=9, pad=5)
             ax_coronal.axis('off')
-            
+
             # Axial (through Y axis)
             ax_axial.clear()
             ax_slice = self.corrected_image[:, slices['axial'], :]
             ax_display = preview_slice(ax_slice, 'axial')
             ax_axial.imshow(ax_display, cmap='gray')
-            ax_axial.axvline(x=ax_display.shape[1]//2, color='green', 
+            ax_axial.axvline(x=ax_display.shape[1]//2, color='green',
                            linestyle='--', linewidth=1, alpha=0.5)
             ax_axial.set_title(f'AXIAL (Y={slices["axial"]})\n'
                              f'Shape: {ax_display.shape} | Top-down | midline vertical',
                              fontsize=9, pad=5)
             ax_axial.axis('off')
-            
+
             # Sagittal (through X axis)
             ax_sagittal.clear()
             sag_slice = self.corrected_image[:, :, slices['sagittal']]
@@ -138,78 +250,77 @@ class AxisVerifier:
                                 f'Shape: {sag_display.shape} | Side view',
                                 fontsize=9, pad=5)
             ax_sagittal.axis('off')
-            
+
             # Update info text
             info_text = (
                 f"Current image shape: {self.corrected_image.shape} (Z, Y, X)\n"
-                f"Preview view: {rotation_preview_view['view'] or 'none'} | "
+                f"Last applied view: {rotation_preview_view['view'] or 'none'} | "
                 f"Angle: {rotation_angle['degrees']:.2f}°"
             )
-            fig.text(0.5, 0.455, info_text, ha='center', fontsize=10,
-                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-            
-            apply_zoom(ax_coronal, cor_display.shape)
-            apply_zoom(ax_axial, ax_display.shape)
-            apply_zoom(ax_sagittal, sag_display.shape)
+            status_text.set_text(info_text)
 
-            fig.canvas.draw()
-        
+            apply_zoom(ax_coronal, cor_display.shape, self.spacing_zyx[[1, 2]])
+            apply_zoom(ax_axial, ax_display.shape, self.spacing_zyx[[0, 2]])
+            apply_zoom(ax_sagittal, sag_display.shape, self.spacing_zyx[[0, 1]])
+
+            fig.canvas.draw_idle()
+
         # Create sliders
-        slider_cor = Slider(ax_slider_cor, 'Coronal', 0, 
-                          self.corrected_image.shape[0]-1, 
+        slider_cor = Slider(ax_slider_cor, 'Coronal', 0,
+                          self.corrected_image.shape[0]-1,
                           valinit=slices['coronal'], valstep=1)
-        slider_ax = Slider(ax_slider_ax, 'Axial', 0, 
-                         self.corrected_image.shape[1]-1, 
+        slider_ax = Slider(ax_slider_ax, 'Axial', 0,
+                         self.corrected_image.shape[1]-1,
                          valinit=slices['axial'], valstep=1)
-        slider_sag = Slider(ax_slider_sag, 'Sagittal', 0, 
-                          self.corrected_image.shape[2]-1, 
+        slider_sag = Slider(ax_slider_sag, 'Sagittal', 0,
+                          self.corrected_image.shape[2]-1,
                           valinit=slices['sagittal'], valstep=1)
-        
+
         def update_coronal(val):
             slices['coronal'] = int(val)
             update_display()
-        
+
         def update_axial(val):
             slices['axial'] = int(val)
             update_display()
-        
+
         def update_sagittal(val):
             slices['sagittal'] = int(val)
             update_display()
-        
+
         slider_cor.on_changed(update_coronal)
         slider_ax.on_changed(update_axial)
         slider_sag.on_changed(update_sagittal)
-        
+
         # Create correction buttons
         button_height = 0.034
         button_width = 0.098
         button_y_start = 0.405
         button_spacing = 0.012
-        
+
         # Swap buttons
         ax_swap_zy = plt.axes([0.1, button_y_start, button_width, button_height])
-        ax_swap_zx = plt.axes([0.1 + button_width + button_spacing, button_y_start, 
+        ax_swap_zx = plt.axes([0.1 + button_width + button_spacing, button_y_start,
                               button_width, button_height])
-        ax_swap_yx = plt.axes([0.1 + 2*(button_width + button_spacing), button_y_start, 
+        ax_swap_yx = plt.axes([0.1 + 2*(button_width + button_spacing), button_y_start,
                               button_width, button_height])
-        
+
         btn_swap_zy = Button(ax_swap_zy, 'Swap Z↔Y')
         btn_swap_zx = Button(ax_swap_zx, 'Swap Z↔X')
         btn_swap_yx = Button(ax_swap_yx, 'Swap Y↔X')
-        
+
         # Flip buttons
         button_y_flip = button_y_start - button_height - button_spacing
         ax_flip_z = plt.axes([0.1, button_y_flip, button_width, button_height])
-        ax_flip_y = plt.axes([0.1 + button_width + button_spacing, button_y_flip, 
+        ax_flip_y = plt.axes([0.1 + button_width + button_spacing, button_y_flip,
                              button_width, button_height])
-        ax_flip_x = plt.axes([0.1 + 2*(button_width + button_spacing), button_y_flip, 
+        ax_flip_x = plt.axes([0.1 + 2*(button_width + button_spacing), button_y_flip,
                              button_width, button_height])
-        
+
         btn_flip_z = Button(ax_flip_z, 'Flip Z')
         btn_flip_y = Button(ax_flip_y, 'Flip Y')
         btn_flip_x = Button(ax_flip_x, 'Flip X')
-        
+
         # Fine rotation controls
         button_y_rotate = button_y_flip - button_height - button_spacing
         ax_rotate_cor = plt.axes([0.1, button_y_rotate, button_width, button_height])
@@ -224,7 +335,7 @@ class AxisVerifier:
         btn_rotate_ax = Button(ax_rotate_ax, 'Rotate Axial')
         btn_rotate_sag = Button(ax_rotate_sag, 'Rotate Sagittal')
         angle_slider = Slider(
-            ax_angle_slider, 'Angle°', -30.0, 30.0, valinit=0.0, valstep=0.1)
+            ax_angle_slider, 'Angle°', -180.0, 180.0, valinit=0.0, valstep=0.1)
         angle_text = TextBox(ax_angle_text, '', initial='0.0')
         fig.text(
             0.78, button_y_rotate + 0.015,
@@ -247,24 +358,14 @@ class AxisVerifier:
         button_y_control = button_y_zoom - button_height - button_spacing
         ax_reset = plt.axes([0.1, button_y_control, button_width, button_height])
         ax_done = plt.axes([0.8, button_y_control, button_width, button_height])
-        
+
         btn_reset = Button(ax_reset, 'Reset')
         btn_done = Button(ax_done, 'Done')
-        
+
         zoom_state = {'factor': 1.0}
 
-        def apply_zoom(axis, image_shape):
-            zoom = zoom_state['factor']
-            if zoom <= 1.0:
-                return
-
-            rows, cols = image_shape
-            center_x = (cols - 1) / 2.0
-            center_y = (rows - 1) / 2.0
-            half_width = cols / (2.0 * zoom)
-            half_height = rows / (2.0 * zoom)
-            axis.set_xlim(center_x - half_width, center_x + half_width)
-            axis.set_ylim(center_y + half_height, center_y - half_height)
+        def apply_zoom(axis, image_shape, spacing_rc):
+            self.fit_viewport(axis, image_shape, spacing_rc, zoom_state['factor'])
 
         def change_zoom(multiplier):
             zoom_state['factor'] = float(np.clip(
@@ -281,38 +382,38 @@ class AxisVerifier:
         def swap_axes(axis1, axis2):
             print(f"\nSwapping axes {axis1} ↔ {axis2}")
             print(f"  Before: {self.corrected_image.shape}")
-            
+
             axes = [0, 1, 2]
             axes[axis1], axes[axis2] = axes[axis2], axes[axis1]
+            self.corrected_to_aligned = self.corrected_to_aligned @ swap_mapping(axis1, axis2)
             self.corrected_image = np.transpose(self.corrected_image, axes)
-            
-            # Update slider ranges
-            slider_cor.valmin = 0
-            slider_cor.valmax = self.corrected_image.shape[0] - 1
-            slider_cor.set_val(self.corrected_image.shape[0] // 2)
-            
-            slider_ax.valmin = 0
-            slider_ax.valmax = self.corrected_image.shape[1] - 1
-            slider_ax.set_val(self.corrected_image.shape[1] // 2)
-            
-            slider_sag.valmin = 0
-            slider_sag.valmax = self.corrected_image.shape[2] - 1
-            slider_sag.set_val(self.corrected_image.shape[2] // 2)
-            
-            slices['coronal'] = self.corrected_image.shape[0] // 2
-            slices['axial'] = self.corrected_image.shape[1] // 2
-            slices['sagittal'] = self.corrected_image.shape[2] // 2
-            
+            self.spacing_zyx = self.spacing_zyx[axes]
+
+            for slider in (slider_cor, slider_ax, slider_sag):
+                slider.eventson = False
+            slices.update(coronal=self.corrected_image.shape[0] // 2,
+                          axial=self.corrected_image.shape[1] // 2,
+                          sagittal=self.corrected_image.shape[2] // 2)
+            for slider, axis, view in ((slider_cor, 0, 'coronal'),
+                                       (slider_ax, 1, 'axial'),
+                                       (slider_sag, 2, 'sagittal')):
+                slider.valmin = 0
+                slider.valmax = self.corrected_image.shape[axis] - 1
+                slider.ax.set_xlim(0, max(1, slider.valmax))
+                slider.set_val(slices[view])
+                slider.eventson = True
+
             print(f"  After: {self.corrected_image.shape}")
             update_display()
-        
+
         def flip_axis(axis):
             print(f"\nFlipping axis {axis}")
+            self.corrected_to_aligned = self.corrected_to_aligned @ flip_mapping(axis, self.corrected_image.shape[axis])
             self.corrected_image = np.flip(self.corrected_image, axis=axis)
             update_display()
 
         def set_rotation_angle(angle):
-            angle = float(np.clip(angle, -30.0, 30.0))
+            angle = float(np.clip(angle, -180.0, 180.0))
             rotation_angle['degrees'] = angle
             return angle
 
@@ -331,53 +432,54 @@ class AxisVerifier:
 
         def rotate_view(view_name):
             angle = rotation_angle['degrees']
-            rotation_preview_view['view'] = view_name
             if abs(angle) < 1e-6:
-                print(f"\nSelected {view_name} rotation preview. Enter a nonzero angle to preview.")
-                update_display()
                 return
-
-            print(f"\nPreviewing {view_name} view at {angle:.3f}°")
-            print("  Positive angles are clockwise in the displayed view.")
-            print("  This is display-only and will not change saved image geometry.")
+            print(f"Applying {view_name} rotation: {angle:.3f} degrees clockwise.")
+            print("The volume and saved coordinate mapping change; outside edges may be cropped.")
+            self.apply_view_rotation(view_name, angle)
+            rotation_preview_view['view'] = view_name
+            angle_slider.set_val(0.0)
+            angle_text.set_val('0.0')
             update_display()
-        
+
         def reset_image(event):
             print("\nResetting to original image")
             self.corrected_image = self.image.copy()
+            self.corrected_to_aligned = np.eye(4)
+            self.spacing_zyx = self.original_spacing_zyx.copy()
+            slices.update(coronal=self.corrected_image.shape[0] // 2,
+                          axial=self.corrected_image.shape[1] // 2,
+                          sagittal=self.corrected_image.shape[2] // 2)
             set_rotation_angle(0.0)
             angle_slider.set_val(0.0)
             angle_text.set_val('0.0')
             zoom_state['factor'] = 1.0
             rotation_preview_view['view'] = None
-            
-            # Reset sliders
-            slider_cor.valmin = 0
-            slider_cor.valmax = self.corrected_image.shape[0] - 1
-            slider_cor.set_val(self.corrected_image.shape[0] // 2)
-            
-            slider_ax.valmin = 0
-            slider_ax.valmax = self.corrected_image.shape[1] - 1
-            slider_ax.set_val(self.corrected_image.shape[1] // 2)
-            
-            slider_sag.valmin = 0
-            slider_sag.valmax = self.corrected_image.shape[2] - 1
-            slider_sag.set_val(self.corrected_image.shape[2] // 2)
-            
-            slices['coronal'] = self.corrected_image.shape[0] // 2
-            slices['axial'] = self.corrected_image.shape[1] // 2
-            slices['sagittal'] = self.corrected_image.shape[2] // 2
-            
+
+            for slider in (slider_cor, slider_ax, slider_sag):
+                slider.eventson = False
+            slices.update(coronal=self.corrected_image.shape[0] // 2,
+                          axial=self.corrected_image.shape[1] // 2,
+                          sagittal=self.corrected_image.shape[2] // 2)
+            for slider, axis, view in ((slider_cor, 0, 'coronal'),
+                                       (slider_ax, 1, 'axial'),
+                                       (slider_sag, 2, 'sagittal')):
+                slider.valmin = 0
+                slider.valmax = self.corrected_image.shape[axis] - 1
+                slider.ax.set_xlim(0, max(1, slider.valmax))
+                slider.set_val(slices[view])
+                slider.eventson = True
+
             update_display()
-        
+
         def done(event):
             plt.close(fig)
-        
+
         # Connect buttons
         btn_swap_zy.on_clicked(lambda e: swap_axes(0, 1))
         btn_swap_zx.on_clicked(lambda e: swap_axes(0, 2))
         btn_swap_yx.on_clicked(lambda e: swap_axes(1, 2))
-        
+
         btn_flip_z.on_clicked(lambda e: flip_axis(0))
         btn_flip_y.on_clicked(lambda e: flip_axis(1))
         btn_flip_x.on_clicked(lambda e: flip_axis(2))
@@ -389,39 +491,41 @@ class AxisVerifier:
         btn_zoom_in.on_clicked(lambda e: change_zoom(1.25))
         btn_zoom_out.on_clicked(lambda e: change_zoom(0.8))
         btn_zoom_reset.on_clicked(reset_zoom)
-        
+
         btn_reset.on_clicked(reset_image)
         btn_done.on_clicked(done)
-        
+
         # Add instructions
         instructions = (
             "Enter degrees, then choose Rotate Coronal / Axial / Sagittal. "
             "Positive = clockwise, negative = counter-clockwise.\n"
-            "Rotation is a selected-view preview only; saved volume geometry is unchanged."
+            "Rotate applies to the volume; Done keeps changes and Reset discards them. Edges may be cropped."
         )
         fig.text(0.52, 0.055, instructions, ha='center', fontsize=8,
                 bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
-        
+
+        fig.canvas.mpl_connect('resize_event', lambda event: update_display())
+
         # Initial display
         update_display()
-        
+
         plt.show()
-        
+
         print("\n" + "="*70)
         print("AXIS VERIFICATION COMPLETE")
         print(f"Final image shape: {self.corrected_image.shape}")
         print("="*70)
-        
+
         return self.corrected_image
 
 
 class MidlineAligner:
     """Interactive midline marking and alignment tool"""
-    
+
     def __init__(self, image, name="MicroCT"):
         """
         Initialize midline aligner
-        
+
         Parameters:
         -----------
         image : numpy.ndarray
@@ -431,26 +535,28 @@ class MidlineAligner:
         """
         self.image = image
         self.name = name
-        
+
         # Store midline points: dict with (view, slice_index) -> list of (row, col) points
         self.midline_points = {}
-        
+        self.selection_to_raw_zyx = np.eye(4)
+        self.loaded_points_xyz = None
+
         # Current view and slice
         self.current_view = None
         self.current_slice = None
-        
+
         # Figure elements
         self.fig = None
         self.ax = None
         self.slider = None
-    
+
     def get_slice_and_info(self, view, slice_idx):
         """Get 2D slice for a given view and provide axis information
-        
+
         NOTE: AXIAL and CORONAL have been swapped compared to the original file
         to match the data orientation requested by the user.
         """
-        
+
         # Image shape convention: (Z, Y, X)
         if view == 'axial':
             # --- CHANGED ---
@@ -485,59 +591,59 @@ class MidlineAligner:
             }
         else:
             raise ValueError(f"Unknown view: {view}")
-        
+
         return slice_2d, info
-    
+
     def onclick(self, event):
         """Handle mouse clicks for midline point selection"""
         if event.inaxes != self.ax or self.current_view is None:
             return
-        
+
         if event.button == 1:  # Left click - add point
             col, row = int(event.xdata), int(event.ydata)
             key = (self.current_view, self.current_slice)
-            
+
             if key not in self.midline_points:
                 self.midline_points[key] = []
-            
+
             self.midline_points[key].append((row, col))
-            
+
             print(f"Added midline point at {self.current_view} slice {self.current_slice}: (row={row}, col={col})")
             print(f"  Total points on this slice: {len(self.midline_points[key])}")
-            
+
             self.update_display()
-    
+
     def update_display(self):
         """Update the display with current slice and midline points"""
         if self.current_view is None:
             return
-            
+
         self.ax.clear()
-        
+
         slice_2d, info = self.get_slice_and_info(self.current_view, self.current_slice)
-        
+
         self.ax.imshow(slice_2d, cmap='gray')
-        
+
         title = (f'{self.name} - {self.current_view.capitalize()} View\n'
                 f'Slice {self.current_slice}/{info["max_slice"]} along {info["slice_axis"]}\n'
                 f'Horizontal: {info["horizontal"]} | Vertical: {info["vertical"]}\n'
                 f'Slices with points: {len(self.midline_points)}')
         self.ax.set_title(title, fontsize=10)
         self.ax.axis('off')
-        
+
         # Draw midline points
         key = (self.current_view, self.current_slice)
         if key in self.midline_points:
             points = np.array(self.midline_points[key])
             self.ax.plot(points[:, 1], points[:, 0], 'r+', markersize=15, markeredgewidth=2)
-            
+
             if len(points) > 1:
                 self.ax.plot(points[:, 1], points[:, 0], 'r-', linewidth=2, alpha=0.7)
-            
+
             for idx, (row, col) in enumerate(points, 1):
-                self.ax.text(col+5, row-5, str(idx), color='red', 
+                self.ax.text(col+5, row-5, str(idx), color='red',
                            fontsize=10, fontweight='bold')
-        
+
         # Show indicator of other slices with points
         y_offset = 30
         for other_key in self.midline_points.keys():
@@ -548,37 +654,37 @@ class MidlineAligner:
                            color='yellow', fontsize=8, fontweight='bold',
                            bbox=dict(boxstyle='round', facecolor='black', alpha=0.5))
                 y_offset += 20
-        
+
         self.fig.canvas.draw()
-    
+
     def _select_view_plane(self):
         """Interactive view plane selection"""
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         fig.suptitle('Select the HORIZONTAL (AXIAL) section for midline marking\n(Click on the view that shows horizontal/top-down slices)',
                     fontsize=14, fontweight='bold')
-        
+
         mid_z = self.image.shape[0] // 2
         mid_y = self.image.shape[1] // 2
         mid_x = self.image.shape[2] // 2
-        
+
         # Show three orthogonal views with simple axis labels
         # View 1: Slicing through Y axis
         axes[0].imshow(self.image[:, mid_y, :], cmap='gray')
         axes[0].set_title('Slice through Y axis\n(Axis index 1)', fontsize=12)
         axes[0].axis('off')
-        
+
         # View 2: Slicing through Z axis
         axes[1].imshow(self.image[mid_z, :, :], cmap='gray')
         axes[1].set_title('Slice through Z axis\n(Axis index 0)', fontsize=12)
         axes[1].axis('off')
-        
+
         # View 3: Slicing through X axis
         axes[2].imshow(self.image[:, :, mid_x], cmap='gray')
         axes[2].set_title('Slice through X axis\n(Axis index 2)', fontsize=12)
         axes[2].axis('off')
-        
+
         selected_view = [None]
-        
+
         def on_click(event):
             if event.inaxes == axes[0]:
                 selected_view[0] = 'axial'
@@ -592,13 +698,13 @@ class MidlineAligner:
                 selected_view[0] = 'sagittal'
                 print("Selected: Slice through X axis (will be treated as SAGITTAL view)")
                 plt.close(fig)
-        
+
         fig.canvas.mpl_connect('button_press_event', on_click)
         plt.tight_layout()
         plt.show()
-        
+
         return selected_view[0]
-    
+
     def mark_midline(self):
         """Launch interactive midline marking interface"""
         print("\n" + "="*70)
@@ -616,19 +722,19 @@ class MidlineAligner:
         print("\nStep 3: Finish")
         print("  - Click 'Done' when satisfied with your markings")
         print("="*70 + "\n")
-        
+
         self.current_view = self._select_view_plane()
         if self.current_view is None:
             print("View selection cancelled")
             return {}
-        
+
         _, info = self.get_slice_and_info(self.current_view, 0)
         self.current_slice = info['max_slice'] // 2
-        
+
         self.fig = plt.figure(figsize=(14, 10))
         self.ax = plt.subplot(1, 1, 1)
         self.update_display()
-        
+
         # Add slider
         ax_slider = plt.axes([0.2, 0.12, 0.6, 0.02])
         _, info = self.get_slice_and_info(self.current_view, self.current_slice)
@@ -640,13 +746,13 @@ class MidlineAligner:
             valinit=self.current_slice,
             valstep=1
         )
-        
+
         def update_slice(val):
             self.current_slice = int(self.slider.val)
             self.update_display()
-        
+
         self.slider.on_changed(update_slice)
-        
+
         # Add buttons
         ax_done = plt.axes([0.7, 0.02, 0.08, 0.04])
         ax_clear = plt.axes([0.62, 0.02, 0.08, 0.04])
@@ -655,7 +761,7 @@ class MidlineAligner:
         ax_axial = plt.axes([0.31, 0.02, 0.07, 0.04])
         ax_coronal = plt.axes([0.38, 0.02, 0.07, 0.04])
         ax_sagittal = plt.axes([0.45, 0.02, 0.07, 0.04])
-        
+
         btn_done = Button(ax_done, 'Done')
         btn_clear = Button(ax_clear, 'Clear Slice')
         btn_clear_all = Button(ax_clear_all, 'Clear All')
@@ -663,40 +769,40 @@ class MidlineAligner:
         btn_axial = Button(ax_axial, 'Axial')
         btn_coronal = Button(ax_coronal, 'Coronal')
         btn_sagittal = Button(ax_sagittal, 'Sagittal')
-        
+
         def on_done(event):
             plt.close(self.fig)
-        
+
         def on_clear(event):
             key = (self.current_view, self.current_slice)
             if key in self.midline_points:
                 del self.midline_points[key]
                 print(f"Cleared points from {self.current_view} slice {self.current_slice}")
                 self.update_display()
-        
+
         def on_clear_all(event):
             self.midline_points.clear()
             print("Cleared all midline points")
             self.update_display()
-        
+
         def change_to_view(new_view):
             self.current_view = new_view
             _, info = self.get_slice_and_info(self.current_view, 0)
             self.current_slice = info['max_slice'] // 2
-            
+
             self.slider.valmin = 0
             self.slider.valmax = info['max_slice']
             self.slider.set_val(self.current_slice)
             self.slider.label.set_text(f'{self.current_view.capitalize()} Slice')
-            
+
             print(f"\nSwitched to {self.current_view.capitalize()} view")
             self.update_display()
-        
+
         def on_change_view(event):
             new_view = self._select_view_plane()
             if new_view:
                 change_to_view(new_view)
-        
+
         btn_done.on_clicked(on_done)
         btn_clear.on_clicked(on_clear)
         btn_clear_all.on_clicked(on_clear_all)
@@ -704,9 +810,9 @@ class MidlineAligner:
         btn_axial.on_clicked(lambda e: change_to_view('axial'))
         btn_coronal.on_clicked(lambda e: change_to_view('coronal'))
         btn_sagittal.on_clicked(lambda e: change_to_view('sagittal'))
-        
+
         self.fig.canvas.mpl_connect('button_press_event', self.onclick)
-        
+
         def on_scroll(event):
             if event.inaxes == self.ax:
                 _, info = self.get_slice_and_info(self.current_view, self.current_slice)
@@ -716,88 +822,68 @@ class MidlineAligner:
                     self.current_slice = max(self.current_slice - 1, 0)
                 self.slider.set_val(self.current_slice)
                 self.update_display()
-        
+
         self.fig.canvas.mpl_connect('scroll_event', on_scroll)
-        
+
         plt.show()
-        
+
         total_points = sum(len(pts) for pts in self.midline_points.values())
         print(f"\n✓ Marked {total_points} midline points across {len(self.midline_points)} view/slice combinations")
-        
+
         return self.midline_points
-    
+
     def fit_midline_plane(self):
         """Fit a plane to the marked midline points"""
         print("\n" + "="*60)
         print("FITTING MIDLINE PLANE")
         print("="*60)
-        
+
         if len(self.midline_points) < 2:
             raise ValueError("Need at least 2 slices with midline points")
-        
-        points_3d = []
-        
-        # Image array convention: (Z, Y, X)
-        # 3D space convention: (x, y, z)
-        for (view, slice_idx), points_2d in self.midline_points.items():
-            for row, col in points_2d:
-                if view == 'axial':
-                    # --- CHANGED ---
-                    # axial now = slicing through Y, displayed (Z, X)
-                    # row = Z, col = X, slice_idx = Y
-                    points_3d.append([col, slice_idx, row])  # (x, y, z)
-                elif view == 'coronal':
-                    # --- CHANGED ---
-                    # coronal now = slicing through Z, displayed (Y, X)
-                    # row = Y, col = X, slice_idx = Z
-                    points_3d.append([col, row, slice_idx])  # (x, y, z)
-                elif view == 'sagittal':
-                    # Sagittal: slice through X, display is (Z, Y)
-                    # row = Z, col = Y, slice_idx = X
-                    points_3d.append([slice_idx, col, row])  # (x, y, z)
-        
-        points_3d = np.array(points_3d)
+
+        points_3d = (self.loaded_points_xyz.copy() if self.loaded_points_xyz is not None
+                     else midline_points_xyz(self.midline_points))
         print(f"Total midline points: {len(points_3d)}")
         print(f"Points from views: {set(view for view, _ in self.midline_points.keys())}")
-        
+
         # Fit plane using SVD
         centroid = points_3d.mean(axis=0)
         points_centered = points_3d - centroid
-        
+
         _, _, vh = np.linalg.svd(points_centered)
         normal = vh[-1, :]
-        
+
         # Ensure consistent normal direction: aim to have normal point roughly along +X
         # (midline plane should be parallel to YZ plane -> normal along X)
         # Note: flipping the normal doesn't change the plane, but affects rotation direction.
         if normal[0] < 0:
             normal = -normal
-        
+
         print(f"Plane normal vector (pre-normalize): {normal}")
         print(f"Plane centroid: {centroid}")
-        
+
         # Calculate rotation to align with YZ plane (target normal along +X)
         target_normal = np.array([1.0, 0.0, 0.0])
-        
+
         # Compute axis/angle
         rotation_axis = np.cross(normal, target_normal)
         rotation_axis_norm = np.linalg.norm(rotation_axis)
-        
+
         if rotation_axis_norm > 1e-6:
             rotation_axis = rotation_axis / rotation_axis_norm
             cos_angle = np.clip(np.dot(normal, target_normal), -1.0, 1.0)
             rotation_angle = np.arccos(cos_angle)
             rotation_angle_deg = np.degrees(rotation_angle)
-            
+
             print(f"Initial rotation axis: {rotation_axis}")
             print(f"Initial rotation angle: {rotation_angle_deg:.2f}°")
-            
+
             # --- NEW: Verify rotation actually moves normal toward target ---
             rot_test = Rotation.from_rotvec(rotation_angle * rotation_axis)
             rotated_normal = rot_test.apply(normal)
             dot_after = np.dot(rotated_normal, target_normal)
             dot_before = np.dot(normal, target_normal)
-            
+
             if dot_after < dot_before - 1e-8:
                 # Rotation is not improving alignment -> invert direction
                 rotation_axis = -rotation_axis
@@ -806,7 +892,7 @@ class MidlineAligner:
                 print("Detected rotation would move normal away from target -- inverting rotation direction.")
                 print(f"Corrected rotation axis: {rotation_axis}")
                 print(f"Corrected rotation angle: {rotation_angle_deg:.2f}°")
-            
+
             # Warn if rotation unusually large (useful diagnostic)
             if abs(rotation_angle_deg) > 45:
                 print(f"⚠ WARNING: Large rotation angle ({rotation_angle_deg:.1f}°)")
@@ -816,7 +902,7 @@ class MidlineAligner:
             rotation_angle = 0.0
             rotation_angle_deg = 0.0
             print("Midline already aligned - no rotation needed")
-        
+
         result = {
             'normal': normal,
             'centroid': centroid,
@@ -825,109 +911,119 @@ class MidlineAligner:
             'rotation_angle_deg': rotation_angle_deg,
             'points_3d': points_3d
         }
-        
+
         print("="*60)
-        
+
         return result
-    
+
     def apply_alignment(self, plane_params, reverse=False):
         """
         Apply rotation to align the image at FULL RESOLUTION
-        
+
         Parameters:
         -----------
         plane_params : dict
             Plane parameters from fit_midline_plane()
         reverse : bool
-            If True, reverse the rotation direction
+            False aligns the fitted plane with YZ (normal use).
+            True deliberately applies the opposite rotation for diagnostics.
         """
         print("\n" + "="*60)
         print("APPLYING ALIGNMENT (FULL RESOLUTION)")
         print("="*60)
 
+        self.aligned_to_raw = np.eye(4)
         rotation_angle = plane_params['rotation_angle']
         rotation_axis = plane_params['rotation_axis']
 
-        # --- FIX: coordinate handedness mismatch (NumPy vs SimpleITK) ---
+        # SimpleITK resampling requires the inverse (output-to-input) rotation.
         rotation_angle = -rotation_angle
-        print("NOTE: Inverting rotation angle to match SimpleITK coordinate system")
+        print("Using the inverse rotation for output-to-input resampling")
 
         # Reverse rotation if requested
         if reverse:
             rotation_angle = -rotation_angle
             print("⚠ REVERSING rotation direction")
-        
+
         if abs(rotation_angle) < 0.001:
             print("Rotation angle is negligible, returning original image")
             return self.image
-        
+
         print(f"Rotating image by {np.degrees(rotation_angle):.2f}°")
         print(f"Rotation axis: {rotation_axis}")
         print(f"Original image size: {self.image.shape}")
         print(f"⚠ Processing at FULL RESOLUTION - this may take several minutes!")
         print("=" * 60)
-        
+
         total_start = time.time()
-        
+
         original_shape = self.image.shape
         original_dtype = self.image.dtype
-        
+
         # NO DOWNSAMPLING - use full resolution
         print(f"\n[Step 1/3] Converting to SimpleITK format...")
         step_start = time.time()
-        
+
         # Convert to float32 for processing
         image_sitk = sitk.GetImageFromArray(self.image.astype(np.float32))
         image_sitk.SetSpacing([1.0, 1.0, 1.0])
-        
+
         step_time = time.time() - step_start
         print(f"  Image shape: {self.image.shape} ({np.prod(self.image.shape):,} voxels)")
         print(f"  ✓ Completed in {step_time:.1f} seconds")
-        
+
         # Set up transformation
         print(f"\n[Step 2/3] Setting up transformation...")
         step_start = time.time()
-        
+
         transform = sitk.AffineTransform(3)
-        
+
         # Use midline centroid as rotation center
         centroid = np.array(plane_params.get('centroid', [s / 2.0 for s in original_shape][::-1]))
-        
+
         # SimpleITK expects (x, y, z) physical point
         center_physical = image_sitk.TransformContinuousIndexToPhysicalPoint(
             [float(centroid[0]), float(centroid[1]), float(centroid[2])]
         )
-        
+
         rotation = Rotation.from_rotvec(rotation_angle * rotation_axis)
         rotation_matrix = rotation.as_matrix()
         matrix_flat = rotation_matrix.flatten().tolist()
-        
+
         transform.SetMatrix(matrix_flat)
         transform.SetCenter(center_physical)
-        
+        # SimpleITK resampling maps output positions to input positions.
+        # Unit spacing above makes these XYZ voxel coordinates; convert to ZYX.
+        xyz_map = np.eye(4)
+        xyz_map[:3, :3] = rotation_matrix
+        center = np.asarray(center_physical)
+        xyz_map[:3, 3] = center - rotation_matrix @ center
+        reverse_axes = np.eye(4)[[2, 1, 0, 3]]
+        self.aligned_to_raw = reverse_axes @ xyz_map @ reverse_axes
+
         step_time = time.time() - step_start
         print(f"  Rotation center: {centroid}")
         print(f"  ✓ Completed in {step_time:.1f} seconds")
-        
+
         # Apply rotation at full resolution
         print(f"\n[Step 3/3] Applying rotation at full resolution...")
         print(f"  Using all available CPU threads...")
         print(f"  ⏳ This will take time - please be patient...")
         step_start = time.time()
-        
+
         resampler = sitk.ResampleImageFilter()
         resampler.SetReferenceImage(image_sitk)
         resampler.SetInterpolator(sitk.sitkLinear)
         resampler.SetTransform(transform)
         resampler.SetDefaultPixelValue(0)
         resampler.SetNumberOfThreads(0)  # Use all available threads
-        
+
         aligned_sitk = resampler.Execute(image_sitk)
         aligned = sitk.GetArrayFromImage(aligned_sitk)
-        
+
         step_time = time.time() - step_start
         print(f"  ✓ Rotation completed in {step_time:.1f} seconds ({step_time/60:.1f} minutes)")
-        
+
         # Convert back to original dtype
         print(f"\nConverting back to original dtype ({original_dtype})...")
         if original_dtype == np.uint16:
@@ -936,128 +1032,92 @@ class MidlineAligner:
             aligned = np.clip(aligned, 0, 255).astype(np.uint8)
         else:
             aligned = aligned.astype(original_dtype)
-        
+
         total_time = time.time() - total_start
         print(f"\n{'='*60}")
         print(f"✓ ALIGNMENT COMPLETE")
         print(f"  Final shape: {aligned.shape}, dtype: {aligned.dtype}")
         print(f"  Total processing time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
         print(f"{'='*60}")
-        
+
         return aligned
-    
+
     def visualize_alignment(self, original, aligned, plane_params, save_path=None):
-        """Visualize the alignment results"""
-        fig = plt.figure(figsize=(16, 12))
-        
-        mid_z = original.shape[0] // 2
-        mid_y = original.shape[1] // 2
-        mid_x = original.shape[2] // 2
-        
-        # Coronal view
-        ax1 = plt.subplot(3, 2, 1)
-        ax1.imshow(original[mid_z, :, :], cmap='gray')
-        ax1.set_title(f'Original - Coronal (Z={mid_z})')
-        ax1.axis('off')
-        
-        key = ('coronal', mid_z)
-        if key in self.midline_points:
-            points = np.array(self.midline_points[key])
-            ax1.plot(points[:, 1], points[:, 0], 'r+', markersize=12, markeredgewidth=2)
-            if len(points) > 1:
-                ax1.plot(points[:, 1], points[:, 0], 'r-', linewidth=2)
-        
-        ax2 = plt.subplot(3, 2, 2)
-        ax2.imshow(aligned[mid_z, :, :], cmap='gray')
-        ax2.set_title(f'Aligned - Coronal (Z={mid_z})')
-        ax2.axis('off')
-        ax2.axvline(x=aligned.shape[2]//2, color='green', linestyle='--', 
-                   linewidth=2, alpha=0.7, label='Expected midline')
-        ax2.legend()
-        
-        # Axial view
-        ax3 = plt.subplot(3, 2, 3)
-        ax3.imshow(original[:, mid_y, :], cmap='gray')
-        ax3.set_title(f'Original - Axial (Y={mid_y})')
-        ax3.axis('off')
-        
-        key = ('axial', mid_y)
-        if key in self.midline_points:
-            points = np.array(self.midline_points[key])
-            ax3.plot(points[:, 1], points[:, 0], 'r+', markersize=12, markeredgewidth=2)
-            if len(points) > 1:
-                ax3.plot(points[:, 1], points[:, 0], 'r-', linewidth=2)
-        
-        ax4 = plt.subplot(3, 2, 4)
-        ax4.imshow(aligned[:, mid_y, :], cmap='gray')
-        ax4.set_title(f'Aligned - Axial (Y={mid_y})')
-        ax4.axis('off')
-        ax4.axvline(x=aligned.shape[2]//2, color='green', linestyle='--', 
-                   linewidth=2, alpha=0.7, label='Expected midline')
-        ax4.legend()
-        
-        # Sagittal view
-        ax5 = plt.subplot(3, 2, 5)
-        ax5.imshow(original[:, :, mid_x], cmap='gray')
-        ax5.set_title(f'Original - Sagittal (X={mid_x})')
-        ax5.axis('off')
-        
-        key = ('sagittal', mid_x)
-        if key in self.midline_points:
-            points = np.array(self.midline_points[key])
-            ax5.plot(points[:, 1], points[:, 0], 'r+', markersize=12, markeredgewidth=2)
-            if len(points) > 1:
-                ax5.plot(points[:, 1], points[:, 0], 'r-', linewidth=2)
-        
-        ax6 = plt.subplot(3, 2, 6)
-        ax6.imshow(aligned[:, :, mid_x], cmap='gray')
-        ax6.set_title(f'Aligned - Sagittal (X={mid_x})')
-        ax6.axis('off')
-        
-        plt.suptitle(f'Midline Alignment Results (Full Resolution)\n'
-                    f'Rotation: {plane_params["rotation_angle_deg"]:.2f}°',
-                    fontsize=14, fontweight='bold')
-        
-        plt.tight_layout()
-        
+        """Show the calculated plane on the actual pre/post-alignment grids."""
+        fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+        normal = np.asarray(plane_params['normal'])
+        plane = np.r_[normal[::-1], -normal @ plane_params['centroid']]
+        mapped_plane = plane_in_output(plane, self.aligned_to_raw)
+        points = np.asarray(plane_params['points_3d'])[:, ::-1]
+        for row, (axis, name, letter) in enumerate(
+                [(0, 'Coronal', 'Z'), (1, 'Axial', 'Y'), (2, 'Sagittal', 'X')]):
+            index = original.shape[axis] // 2
+            remaining = [i for i in range(3) if i != axis]
+            for col, (volume, equation, label) in enumerate(
+                    [(original, plane, 'Original'), (aligned, mapped_plane, 'Aligned')]):
+                ax = axes[row, col]
+                ax.imshow(np.take(volume, index, axis=axis), cmap='gray')
+                ax.set_title(f'{label} - {name} ({letter}={index})')
+                ax.axis('off')
+                draw_midline_intersection(ax, equation, axis, index, volume.shape)
+                if col == 0:
+                    visible = points[np.abs(points[:, axis] - index) < .5]
+                    if len(visible):
+                        ax.plot(visible[:, remaining[1]], visible[:, remaining[0]],
+                                'r+', markersize=12, markeredgewidth=2)
+        fig.suptitle('Midline Alignment Results (Full Resolution)\n'
+                     f'Rotation: {plane_params["rotation_angle_deg"]:.2f}°',
+                     fontsize=14, fontweight='bold')
+        fig.tight_layout()
         if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"\n✓ Visualization saved to: {save_path}")
-        
+            fig.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f'Alignment visualization saved to: {save_path}')
         plt.show()
-    
+
     def save_midline_points(self, filepath):
         """Save midline points to JSON file"""
         data = {
-            'midline_points': {f"{k[0]}_{k[1]}": [list(p) for p in v] 
+            'selection_to_raw_zyx': self.selection_to_raw_zyx.tolist(),
+            'points_xyz': (self.loaded_points_xyz if self.loaded_points_xyz is not None
+                           else midline_points_xyz(self.midline_points)).tolist(),
+            'midline_points': {f"{k[0]}_{k[1]}": [list(p) for p in v]
                              for k, v in self.midline_points.items()}
         }
-        
-        with open(filepath, 'w') as f:
+
+        with open(filepath, 'w', encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        
+
         print(f"✓ Midline points saved to: {filepath}")
-    
+
     def load_midline_points(self, filepath):
         """Load midline points from JSON file"""
-        with open(filepath, 'r') as f:
+        with open(filepath, 'r', encoding="utf-8") as f:
             data = json.load(f)
-        
+
         self.midline_points = {}
         for k, v in data['midline_points'].items():
             view, slice_idx = k.rsplit('_', 1)
             self.midline_points[(view, int(slice_idx))] = [tuple(p) for p in v]
-        
+
+        old_points = np.asarray(data.get('points_xyz', midline_points_xyz(self.midline_points)), dtype=float)
+        old_to_raw = np.asarray(data.get('selection_to_raw_zyx', np.eye(4)), dtype=float)
+        old_to_current = np.linalg.inv(self.selection_to_raw_zyx) @ old_to_raw
+        old_zyx = old_points[:, ::-1]
+        self.loaded_points_xyz = (old_zyx @ old_to_current[:3, :3].T + old_to_current[:3, 3])[:, ::-1]
         print(f"✓ Loaded midline points from: {filepath}")
 
 
 # Example usage
 if __name__ == "__main__":
     from data_loader import DataLoader
-    
+
     import sys
-    PROJECT_PATH = resolve_project_path(sys.argv[1] if len(sys.argv) > 1 else None)
-    
+    import argparse
+    parser = argparse.ArgumentParser(description='Orient a scan and align its midline.')
+    parser.add_argument("project_path", nargs="?", help="Project folder containing data/.")
+    args = parser.parse_args()
+    PROJECT_PATH = resolve_project_path(args.project_path)
+
     # Load microCT data
     print("Loading microCT data...")
     loader = DataLoader(PROJECT_PATH)
@@ -1065,22 +1125,48 @@ if __name__ == "__main__":
         iter(sorted(loader.data_path.glob("*.tif")) + sorted(loader.data_path.glob("*.tiff"))),
         None,
     )
-    microct = loader.load_microct()
-    
+    microct = loader.load_microct(filename=source_image_path.name) if source_image_path else loader.load_microct()
+
+    raw_shape = microct.shape
+    orientation_to_raw = np.eye(4)
+    spacing_zyx = None
+    if source_image_path is not None:
+        sidecar = source_image_path.with_suffix(source_image_path.suffix + '.metadata.json')
+        if sidecar.exists():
+            metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+            spacing_zyx = metadata.get('spacing_um_zyx')
+            if spacing_zyx is None and metadata.get('spacing_um_xyz') is not None:
+                spacing_zyx = metadata['spacing_um_xyz'][::-1]
+    response = input("\nDo you want to verify/correct axis orientation before marking the midline? (y/n): ").lower()
+    orientation_used = response == 'y'
+    if orientation_used:
+        verifier = AxisVerifier(microct, name="MicroCT", spacing_zyx=spacing_zyx if spacing_zyx is not None else (1., 1., 1.))
+        microct = verifier.verify_and_correct_axes()
+        orientation_to_raw = verifier.corrected_to_aligned.copy()
+        if spacing_zyx is not None:
+            spacing_zyx = verifier.spacing_zyx.tolist()
+
     # Initialize aligner
     aligner = MidlineAligner(microct, name="MicroCT")
-    
+    aligner.selection_to_raw_zyx = orientation_to_raw.copy()
+
     # Interactive midline marking
-    midline_points = aligner.mark_midline()
-    
+    existing_midline = PROJECT_PATH / "data" / "midline_points.json"
+    if existing_midline.exists() and input("Reuse saved midline points? (y/n): ").lower() == 'y':
+        aligner.load_midline_points(existing_midline)
+        midline_points = aligner.midline_points
+    else:
+        midline_points = aligner.mark_midline()
+
     # Save midline points
     midline_file = PROJECT_PATH / "data" / "midline_points.json"
+    backup(midline_file)
     aligner.save_midline_points(midline_file)
-    
+
     # Fit plane and calculate alignment
     if len(midline_points) >= 2:
         plane_params = aligner.fit_midline_plane()
-        
+
         # Ask user if rotation direction looks correct
         print("\n" + "="*60)
         print("ROTATION DIRECTION CHECK")
@@ -1092,72 +1178,41 @@ if __name__ == "__main__":
         print("\nIf the alignment result looks wrong (rotated in wrong direction),")
         print("you can set reverse=True in apply_alignment() call below.")
         print("="*60)
-        
+
         # Apply alignment at full resolution (set reverse=True if rotation is in wrong direction)
         aligned_image = aligner.apply_alignment(plane_params, reverse=False)
-        
+        output_to_raw = orientation_to_raw @ aligner.aligned_to_raw
+
         # Visualize results
         output_path = PROJECT_PATH / "outputs"
         output_path.mkdir(exist_ok=True)
         aligner.visualize_alignment(
-            microct, 
-            aligned_image, 
+            microct,
+            aligned_image,
             plane_params,
             save_path=output_path / "00_midline_alignment_fullres.png"
         )
-        
-        # === NEW: AXIS VERIFICATION STEP ===
-        print("\n" + "="*70)
-        print("AXIS VERIFICATION STEP")
-        print("="*70)
-        print("Now you can verify and correct the axis orientation if needed.")
-        print("This is useful if coronal/axial/sagittal views appear swapped.")
-        
-        response = input("\nDo you want to verify/correct axis orientation? (y/n): ").lower()
-        
-        if response == 'y':
-            verifier = AxisVerifier(aligned_image, name="Aligned MicroCT")
-            corrected_image = verifier.verify_and_correct_axes()
-            
-            # Ask if user wants to save the corrected image
-            response = input("\nDo you want to save the axis-corrected image? (y/n): ").lower()
-            
-            if response == 'y':
-                # Save corrected image
-                processed_path = PROJECT_PATH / "data" / "processed"
-                processed_path.mkdir(exist_ok=True)
-                output_file = processed_path / "microct_aligned_corrected.tif"
-                
-                print(f"\nSaving axis-corrected image (this may take a few minutes)...")
-                tifffile.imwrite(output_file, corrected_image)
-                print(f"✓ Axis-corrected image saved to: {output_file}")
-                if source_image_path is not None:
-                    copy_metadata_sidecar(source_image_path, output_file)
-                
-                # Update the aligned image reference
-                aligned_image = corrected_image
-            else:
-                print("Axis-corrected image not saved. Using original aligned image.")
-        else:
-            print("Skipping axis verification step.")
-        
-        # Save final aligned image (if not already saved as corrected)
-        if response != 'y' or input("\nAlso save original aligned image? (y/n): ").lower() == 'y':
-            processed_path = PROJECT_PATH / "data" / "processed"
-            processed_path.mkdir(exist_ok=True)
-            output_file = processed_path / "microct_aligned_fullres.tif"
-            
-            print(f"\nSaving aligned image (this may take a few minutes)...")
+
+        # Save the final image with the composed orientation + alignment mapping.
+        processed_path = PROJECT_PATH / "data" / "processed"
+        processed_path.mkdir(exist_ok=True)
+        output_file = processed_path / ("microct_aligned_corrected.tif" if orientation_used
+                                        else "microct_aligned_fullres.tif")
+        save_result = (not orientation_used or
+                       input("\nDo you want to save the axis-corrected image? (y/n): ").lower() == 'y')
+        if save_result:
+            backup(output_file)
             tifffile.imwrite(output_file, aligned_image)
-            print(f"✓ Aligned image saved to: {output_file}")
+            save_mapping(output_file, source_image_path, aligned_image, raw_shape, output_to_raw)
+            print(f"Aligned image saved to: {output_file}")
             if source_image_path is not None:
-                copy_metadata_sidecar(source_image_path, output_file)
-        
+                copy_metadata_sidecar(source_image_path, output_file, spacing_zyx)
+
         print("\n" + "="*60)
         print("NEXT STEPS")
         print("="*60)
         print("1. Check the alignment visualization")
-        print("2. The green dashed line should align with the brain midline")
+        print("2. Yellow lines show the calculated midline plane intersecting each slice")
         print("3. Verify axis orientation is correct")
         print("4. If alignment looks good, use the saved .tif file for registration")
         print("5. If not satisfied, run again and adjust midline points")

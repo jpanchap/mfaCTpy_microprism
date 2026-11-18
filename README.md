@@ -54,21 +54,31 @@
 
 ### Prerequisites
 
-- Python 3.8 or higher
+- Python 3.9 or higher (Python 3.11 recommended)
 - Windows, macOS, or Linux
+
+### Recommended setup (all platforms)
+
+From the repository folder, using Conda:
+
+```bash
+conda env create -f environment.yml
+conda activate mfaCT
+python -m pip check
+```
+
+This installs Python 3.11 and Tk for desktop viewers. See
+[Cross-platform setup and testing](docs/platform_support.md) for platform details
+and current verification limits.
 
 ### Required Python Packages
 
 ```bash
-pip install numpy tifffile matplotlib scipy SimpleITK pandas nrrd requests pydicom tqdm opencv-python bg-atlasapi
+python -m pip install -r requirements.txt
 ```
 
-### Optional Packages
-
-For additional functionality:
-```bash
-pip install scikit-image pillow
-```
+The requirements include scikit-image and Pillow. The NRRD package is named
+`pynrrd` on pip and imported as `nrrd` in Python.
 
 ---
 
@@ -204,6 +214,20 @@ python dicom_loader.py
 **Script**: `data_loader.py`
 
 **Purpose**: Load microCT .tif files and Allen CCF atlas for inspection.
+
+From the repository folder, pass the project containing `data/` (quote paths
+with spaces):
+
+```bash
+python src/data_loader.py "/path/to/project"
+python src/data_loader.py "/path/to/project" --image scan.tif --atlas-resolution 25 --no-show
+```
+
+On Windows, use a path such as `"C:\Users\yourname\project"`. If you run the
+script from inside the project or one of its subfolders, omit the project
+argument; it discovers the ancestor containing `data/`, like the alignment
+and registration scripts. `--no-show` skips the viewer, but still loads the
+atlas and may download it if it is not cached. `--help` lists all options.
 
 **Usage**:
 ```python
@@ -703,3 +727,9 @@ For questions or issues:
 4. Check that all dependencies are installed
 
 ---
+
+### Microprism viewer controls
+
+See [Prism GUI guide](docs/prism_gui_guide.md) for every tracker/mapper control,
+labels and line meanings, keyboard navigation, and metadata permission troubleshooting.
+See [Fixed-dimension prism fitting](docs/prism_dimension_fit.md) for the two-method workflow.

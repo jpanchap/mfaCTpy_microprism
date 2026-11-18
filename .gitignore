@@ -13,6 +13,7 @@ src/microprism_registration_qc_3d.py
 
 # Script outputs and working notes
 outputs/
+output/
 Claude outputs/
 
 # Imaging data is never committed
@@ -25,3 +26,13 @@ Claude outputs/
 *.mat
 *.h5
 *.hdf5
+
+# Local test-data generator, not part of the published pipeline
+tools/
+
+# Local working notes for Claude Code
+CLAUDE.md
+
+# Local Python environments
+.venv/
+venv/

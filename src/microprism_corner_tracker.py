@@ -50,6 +50,7 @@ import matplotlib.image as mpimg
 import numpy as np
 import tifffile
 from matplotlib.widgets import Button, Slider
+from microprism_geometry import fit_prism, face_records, slice_intersection
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SETTINGS
@@ -177,113 +178,89 @@ def spacing_xyz_from_values_um(values, source: str) -> Optional[Tuple[float, flo
 
 
 def infer_spacing_xyz_mm(image_path: Path) -> Optional[Tuple[float, float, float]]:
-    """Infer X/Y/Z voxel spacing from sidecar or TIFF/ImageJ metadata."""
+    """Read physical XYZ spacing; unreadable sidecars may fall back to TIFF metadata."""
     sidecar_path = image_path.with_suffix(image_path.suffix + ".metadata.json")
-    if sidecar_path.exists():
-        with open(sidecar_path, "r") as f:
-            metadata = json.load(f)
-
-        if metadata.get("spacing_um_xyz"):
-            spacing = spacing_xyz_from_values_um(
-                metadata["spacing_um_xyz"], "metadata sidecar")
-            if spacing is not None:
-                return spacing
-        if metadata.get("spacing_um_zyx"):
-            zyx = metadata["spacing_um_zyx"]
-            spacing = spacing_xyz_from_values_um(
-                [zyx[2], zyx[1], zyx[0]], "metadata sidecar")
-            if spacing is not None:
-                return spacing
-        if metadata.get("spacing_mm_xyz"):
-            values = tuple(float(v) for v in metadata["spacing_mm_xyz"])
-            if len(values) == 3 and all(v > 0 for v in values):
-                print(
-                    "✓ Inferred voxel spacing from metadata sidecar: "
-                    f"X={values[0]:g}, Y={values[1]:g}, Z={values[2]:g} mm"
-                )
-                return values
-        if metadata.get("spacing_mm"):
-            value = float(metadata["spacing_mm"])
-            if value > 0:
-                print(f"✓ Inferred isotropic voxel spacing from metadata sidecar: {value:g} mm")
-                return (value, value, value)
+    try:
+        with sidecar_path.open("r", encoding="utf-8") as stream:
+            metadata = json.load(stream)
+        if not isinstance(metadata, dict):
+            raise ValueError("Expected a metadata object")
+        for key, scale in (("spacing_um_xyz", .001), ("spacing_um_zyx", .001),
+                           ("spacing_mm_xyz", 1), ("spacing_mm", 1)):
+            if key not in metadata:
+                continue
+            values = np.asarray(metadata[key], dtype=float)
+            if values.ndim == 0:
+                values = np.repeat(values, 3)
+            if key.endswith("zyx"):
+                values = values[::-1]
+            if values.shape == (3,) and np.all(np.isfinite(values)) and np.all(values > 0):
+                values = values * scale
+                print(f"✓ Voxel spacing from {sidecar_path.name}: XYZ={tuple(values)} mm")
+                return tuple(float(v) for v in values)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"WARNING: Could not read voxel-size metadata: {sidecar_path}\n  {exc}\n"
+              "  Trying TIFF metadata. You can bypass metadata with verified --spacing or --spacing-x/y/z values (mm).")
 
     try:
         with tifffile.TiffFile(str(image_path)) as tif:
-            imagej_metadata = tif.imagej_metadata or {}
-            unit = str(imagej_metadata.get("unit", "")).lower()
-            spacing = imagej_metadata.get("spacing")
-            x_resolution = tif.pages[0].tags.get("XResolution")
-            y_resolution = tif.pages[0].tags.get("YResolution")
-            resolution_unit = tif.pages[0].tags.get("ResolutionUnit")
-    except Exception:
-        return None
-
-    if spacing is not None and unit in {"um", "µm", "micron", "microns"}:
-        value = float(spacing) / 1000.0
-        print(f"✓ Inferred isotropic voxel spacing from ImageJ TIFF metadata: {float(spacing):g} µm")
-        return (value, value, value)
-
-    if x_resolution and y_resolution and resolution_unit:
-        unit_name = str(resolution_unit.value).upper()
-        if unit_name in {"CENTIMETER", "INCH"}:
-            x_per_unit = rational_to_float(x_resolution.value)
-            y_per_unit = rational_to_float(y_resolution.value)
-            unit_um = 10000.0 if unit_name == "CENTIMETER" else 25400.0
-            values_um = [unit_um / x_per_unit, unit_um / y_per_unit]
-            if values_um[0] > 0 and values_um[1] > 0:
-                z_um = values_um[0] if abs(values_um[0] - values_um[1]) < 1e-6 else None
-                if z_um is not None:
-                    return spacing_xyz_from_values_um(
-                        [values_um[0], values_um[1], z_um], "TIFF resolution tags")
-
+            metadata = tif.imagej_metadata or {}
+            unit = str(metadata.get("unit", "")).lower()
+            unit_mm = {"um": .001, "µm": .001, "micron": .001, "microns": .001,
+                       "mm": 1.0, "millimeter": 1.0}.get(unit)
+            tags = tif.pages[0].tags
+            xr = rational_to_float(tags['XResolution'].value) if 'XResolution' in tags else None
+            yr = rational_to_float(tags['YResolution'].value) if 'YResolution' in tags else None
+            ru = int(tags['ResolutionUnit'].value) if 'ResolutionUnit' in tags else 1
+            xy_unit_mm = {2: 25.4, 3: 10.0}.get(ru, unit_mm)
+            z = metadata.get('spacing')
+            if xr and yr and z is not None and xy_unit_mm is not None and unit_mm is not None:
+                values = (xy_unit_mm / xr, xy_unit_mm / yr, float(z) * unit_mm)
+                if all(np.isfinite(v) and v > 0 for v in values):
+                    print(f"✓ Voxel spacing from TIFF metadata: XYZ={values} mm")
+                    return values
+            # X/Y resolution alone does not establish the slice spacing Z.
+    except (OSError, ValueError, TypeError, ZeroDivisionError) as exc:
+        print(f"WARNING: Could not read usable TIFF spacing from {image_path}: {exc}")
     return None
 
 
-def prompt_spacing_xyz_mm(default_um: float = 72.0) -> Tuple[float, float, float]:
-    """Ask the user for isotropic voxel spacing in micrometers."""
+def prompt_spacing_xyz_mm() -> Tuple[float, float, float]:
+    """Require verified physical spacing; never silently assume a lower-resolution scan's spacing."""
     while True:
         try:
-            raw = input(
-                "\nCould not determine microCT voxel spacing automatically.\n"
-                f"Enter microCT voxel spacing in micrometers, e.g. 72 [{default_um:g}]: "
-            ).strip()
-        except EOFError:
-            raw = ""
-        if raw == "":
-            value_um = float(default_um)
-        else:
-            try:
-                value_um = float(raw)
-            except ValueError:
-                print("  Please enter a number, for example 72.")
-                continue
-        if value_um <= 0:
-            print("  Spacing must be positive.")
-            continue
-        value_mm = value_um / 1000.0
-        return (value_mm, value_mm, value_mm)
+            raw = input("\nVoxel spacing could not be determined. Enter verified spacing in micrometers\n"
+                        "(one value for isotropic voxels, or X,Y,Z; no default): ").strip()
+        except EOFError as exc:
+            raise ValueError("Voxel spacing is required. Supply --spacing MM or all three --spacing-x/y/z MM values.") from exc
+        try:
+            values = [float(v) / 1000 for v in raw.replace(',', ' ').split()]
+            if len(values) == 1:
+                values *= 3
+            if len(values) == 3 and all(np.isfinite(v) and v > 0 for v in values):
+                return tuple(values)
+        except ValueError:
+            pass
+        print("Enter one or three finite positive numbers from this image's acquisition/processing metadata.")
 
 
 def spacing_xyz_from_args(args, image_path: Path) -> Tuple[float, float, float]:
-    """Return spacing in SimpleITK/coordinate order: (x_mm, y_mm, z_mm)."""
-    inferred = None
-    if args.spacing is None or args.spacing_x is None or args.spacing_y is None or args.spacing_z is None:
-        inferred = infer_spacing_xyz_mm(image_path)
-    if inferred is None and args.spacing is None:
-        inferred = prompt_spacing_xyz_mm()
-
+    """Explicit complete spacing bypasses metadata access, including inaccessible sidecars."""
+    overrides = (args.spacing_x, args.spacing_y, args.spacing_z)
     if args.spacing is not None:
-        base_values = (float(args.spacing), float(args.spacing), float(args.spacing))
+        base = (args.spacing,) * 3
+    elif all(v is not None for v in overrides):
+        base = overrides
     else:
-        base_values = inferred
-
-    x = args.spacing_x if args.spacing_x is not None else base_values[0]
-    y = args.spacing_y if args.spacing_y is not None else base_values[1]
-    z = args.spacing_z if args.spacing_z is not None else base_values[2]
-    values = (float(x), float(y), float(z))
-    if any(value <= 0 for value in values):
-        raise ValueError("All spacing values must be positive.")
+        base = infer_spacing_xyz_mm(image_path)
+        if base is None:
+            base = prompt_spacing_xyz_mm()
+    values = tuple(float(v if v is not None else base[i]) for i, v in enumerate(overrides))
+    if not all(np.isfinite(v) and v > 0 for v in values):
+        raise ValueError("All spacing values must be finite and positive.")
+    print(f"Using voxel spacing XYZ={values} mm")
     return values
 
 
@@ -315,10 +292,19 @@ class MicroprismCornerTracker:
         )
         self.prism_width_mm = float(prism_width_mm)
         self.prism_length_mm = float(prism_length_mm)
+        self.derivation_method = "fixed"
+        self.fit_branch = "A"
+        self.confirmed_fit_signature = None
+        self.geometry_status = "Complete P1–P4 to preview the fixed-dimension fit."
+        if not np.all(np.isfinite([prism_width_mm, prism_length_mm])) or min(prism_width_mm, prism_length_mm) <= 0:
+            raise ValueError("Prism dimensions must be finite and positive.")
         self.maximize   = bool(maximize)
 
         print(f"\nLoading: {self.image_path.name}")
-        self.image = tifffile.imread(str(self.image_path))
+        try:
+            self.image = tifffile.memmap(str(self.image_path), mode="r")
+        except ValueError:
+            self.image = tifffile.imread(str(self.image_path))
         if self.image.ndim == 4 and self.image.shape[0] == 1:
             self.image = self.image[0]
         if self.image.ndim != 3:
@@ -334,16 +320,19 @@ class MicroprismCornerTracker:
         )
         print(f"  Prism width W: {self.prism_width_mm:g} mm")
         print(f"  Prism length l: {self.prism_length_mm:g} mm")
+        print("  Fixed fit assumes a right prism with depth = imaging-face length.")
+        print("  Preview A/B, then click Use orientation. Original method remains available.")
         print("  Reminder: after each view, compare P1-P4 voxel coordinates.")
         print("            Matching corners should be relatively consistent across views.")
 
-        # Normalize contrast for display only. Coordinates are always saved in
-        # the original voxel space, not in this normalized image.
-        img_f = self.image.astype(np.float32, copy=False)
-        lo, hi = np.percentile(img_f, [1, 99])
+        # Estimate contrast from a bounded sample, then normalize only displayed slices.
+        # This avoids allocating multiple float32 copies of a high-resolution volume.
+        stride = max(1, int(np.ceil((self.image.size / 1_000_000) ** (1 / 3))))
+        sample = np.asarray(self.image[::stride, ::stride, ::stride], dtype=np.float32)
+        lo, hi = np.percentile(sample, [1, 99])
         if hi <= lo:
-            lo, hi = float(img_f.min()), float(img_f.max())
-        self.img_disp = np.clip((img_f - lo) / (hi - lo + 1e-8), 0, 1)
+            lo, hi = float(sample.min()), float(sample.max())
+        self.display_limits = (float(lo), float(hi))
 
         # Determine output folder if the user did not pass --output.
         if output_dir is None:
@@ -375,6 +364,7 @@ class MicroprismCornerTracker:
         self._save_warned     = False
         self._updating_slider = False
         self.show_overlays    = False
+        self.show_point_labels = True
         self.pan_mode         = False
         self.zoom_factor      = 1.0
         self.zoom_center: Optional[Tuple[float, float]] = None
@@ -399,9 +389,18 @@ class MicroprismCornerTracker:
 
     def start(self) -> None:
         """Launch the GUI window after printing terminal instructions."""
-        self._print_instructions()
-        self._build_ui()
-        plt.show()
+        try:
+            self._print_instructions()
+            self._build_ui()
+            plt.show()
+        finally:
+            self.close()
+
+    def close(self):
+        """Release the TIFF mapping, including on Windows where it locks the file."""
+        mapping = getattr(self.image, "_mmap", None)
+        if mapping is not None and not mapping.closed:
+            mapping.close()
 
     # ─────────────────────────────────────────────────────────────────────
     # UI BUILD — matches postdoc / midline_alignment.py style
@@ -409,104 +408,96 @@ class MicroprismCornerTracker:
     # ─────────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        """Build the Matplotlib UI: brain image, guide, slider, buttons, hints.
-
-        Changes made here:
-        - Brain image panel is larger.
-        - Bottom controls are moved upward so labels are not clipped.
-        - The keyboard-hint box is moved above the figure edge for padding.
-        """
-        # Larger figure gives the brain image room while keeping controls readable.
-        self.fig = plt.figure(figsize=(23, 11.5))
+        """Fixed panel slots with dedicated status, navigation and fitting rows."""
+        self.fig = plt.figure(figsize=(18, 10))
         self.fig.patch.set_facecolor("white")
-
-        # Main image axes.
-        # [left, bottom, width, height] are figure-relative coordinates.
-        self.ax = self.fig.add_axes([0.220, 0.205, 0.510, 0.745])
-        self.ax.set_facecolor("black")
-
-        self.preview_axes = {
-            "coronal":  self.fig.add_axes([0.735, 0.555, 0.255, 0.370]),
-            "sagittal": self.fig.add_axes([0.735, 0.555, 0.255, 0.370]),
-            "axial":    self.fig.add_axes([0.735, 0.135, 0.255, 0.370]),
-        }
-        for ax_prev in self.preview_axes.values():
-            ax_prev.set_facecolor("black")
-
-        self.ax_list = self.fig.add_axes([0.020, 0.565, 0.205, 0.360])
+        self.ax = self.fig.add_axes([.225, .325, .49, .595])
+        self.preview_axes = {view: self.fig.add_axes([.745, .625, .24, .295])
+                             for view in ORIENT_KEYS}
+        self.ax_list = self.fig.add_axes([.015, .61, .195, .315])
         self.ax_list.set_axis_off()
-
-        # Visual guide — smaller and tucked under the coordinate table.
-        self.ax_guide = self.fig.add_axes([0.065, 0.185, 0.095, 0.315])
-        self.ax_guide.set_facecolor("#f7f4e8")  # wheat/cream tone
+        self.ax_guide = self.fig.add_axes([.04, .285, .15, .285])
+        self.ax_guide.set_facecolor("#f7f4e8")
         if GUIDE_IMAGE_PATH.exists():
             self.guide_image = mpimg.imread(GUIDE_IMAGE_PATH)
-
-        # Slider — same width as the larger brain panel, with padding above the
-        # button rows.
-        ax_sl = self.fig.add_axes([0.220, 0.145, 0.510, 0.022])
-        self.slider = Slider(
-            ax_sl, "Coronal slice", 0, self.nz - 1,
-            valinit=self.current_slice, valstep=1
-        )
+        self.fit_status_text = self.fig.text(.23, .275, "", fontsize=8, color="#126b42")
+        self.slider = Slider(self.fig.add_axes([.28, .23, .67, .022]), "Slice", 0,
+                             max(1, self.nz-1), valinit=self.current_slice, valstep=1)
         self.slider.on_changed(self._on_slider)
-
-        # View buttons — row 1, moved upward and slightly widened to prevent
-        # text clipping.
-        view_specs = [
-            ("coronal",  "Coronal",  [0.220, 0.088, 0.105, 0.042]),
-            ("sagittal", "Sagittal", [0.338, 0.088, 0.105, 0.042]),
-            ("axial",    "Axial",    [0.456, 0.088, 0.105, 0.042]),
+        controls = [
+            ("coronal", "Coronal (C)", [.225,.165,.105,.043], lambda e:self._switch_view("coronal")),
+            ("sagittal", "Sagittal (S)", [.34,.165,.105,.043], lambda e:self._switch_view("sagittal")),
+            ("axial", "Axial (A)", [.455,.165,.105,.043], lambda e:self._switch_view("axial")),
+            ("previous", "← Slice", [.57,.165,.085,.043], lambda e:self._step_slice(-1)),
+            ("next", "Slice →", [.665,.165,.085,.043], lambda e:self._step_slice(1)),
+            ("labels", "Labels on (L)", [.76,.165,.125,.043], self._toggle_labels),
+            ("help", "Help (?)", [.895,.165,.09,.043], lambda e:self._print_instructions()),
+            ("undo", "Undo (U)", [.225,.105,.10,.043], self._on_undo),
+            ("overlay", "Show overlays", [.335,.105,.145,.043], self._on_toggle_overlays),
+            ("pan", "Pan off", [.49,.105,.10,.043], self._on_toggle_pan),
+            ("zoom_in", "Zoom +", [.60,.105,.10,.043], lambda e:self._change_zoom(1.5)),
+            ("zoom_out", "Zoom −", [.71,.105,.10,.043], lambda e:self._change_zoom(1/1.5)),
+            ("zoom_reset", "Fit image (0)", [.82,.105,.165,.043], lambda e:self._reset_zoom()),
+            ("method", "Method: Fixed", [.225,.045,.19,.043], self._toggle_method),
+            ("branch", "Preview: A", [.43,.045,.16,.043], self._toggle_branch),
+            ("confirm_fit", "Use orientation A", [.605,.045,.21,.043], self._confirm_fit),
+            ("save", "Save & Quit", [.025,.105,.165,.043], self._on_save),
+            ("quit", "Quit (no save)", [.025,.045,.165,.043], lambda e:plt.close(self.fig)),
         ]
-        for key, label, pos in view_specs:
-            ax_b = self.fig.add_axes(pos)
-            btn  = Button(
-                ax_b, label,
-                color=ORIENT_COLORS[key],
-                hovercolor=ORIENT_COLORS[key],
-            )
-            btn.label.set_color("white")
-            btn.label.set_fontweight("bold")
-            btn.on_clicked(lambda e, v=key: self._switch_view(v))
-            self.buttons[key] = btn
-
-        # Action and inspection buttons.
-        self.buttons["undo"] = Button(
-            self.fig.add_axes([0.220, 0.038, 0.075, 0.035]), "Undo")
-        self.buttons["overlay"] = Button(
-            self.fig.add_axes([0.303, 0.038, 0.105, 0.035]), "Show overlays")
-        self.buttons["pan"] = Button(
-            self.fig.add_axes([0.416, 0.038, 0.075, 0.035]), "Pan off")
-        self.buttons["zoom_in"] = Button(
-            self.fig.add_axes([0.499, 0.038, 0.060, 0.035]), "Zoom +")
-        self.buttons["zoom_out"] = Button(
-            self.fig.add_axes([0.567, 0.038, 0.060, 0.035]), "Zoom -")
-        self.buttons["zoom_reset"] = Button(
-            self.fig.add_axes([0.635, 0.038, 0.060, 0.035]), "Zoom 1x")
-        self.buttons["save"] = Button(
-            self.fig.add_axes([0.055, 0.095, 0.135, 0.035]), "Save & Quit")
-        self.buttons["quit"] = Button(
-            self.fig.add_axes([0.055, 0.045, 0.135, 0.035]), "Quit (no save)")
-
-        self.buttons["undo"].on_clicked(self._on_undo)
-        self.buttons["overlay"].on_clicked(self._on_toggle_overlays)
-        self.buttons["pan"].on_clicked(self._on_toggle_pan)
-        self.buttons["zoom_in"].on_clicked(lambda _e: self._change_zoom(1.5))
-        self.buttons["zoom_out"].on_clicked(lambda _e: self._change_zoom(1/1.5))
-        self.buttons["zoom_reset"].on_clicked(lambda _e: self._reset_zoom())
-        self.buttons["save"].on_clicked(self._on_save)
-        self.buttons["quit"].on_clicked(lambda e: plt.close(self.fig))
-
-        # Event hookups: all mouse/keyboard input goes through these handlers.
-        self.fig.canvas.mpl_connect("button_press_event", self._on_click)
-        self.fig.canvas.mpl_connect("button_release_event", self._on_release)
-        self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
-        self.fig.canvas.mpl_connect("scroll_event",       self._on_scroll)
-        self.fig.canvas.mpl_connect("key_press_event",    self._on_key)
-
+        for key, label, pos, callback in controls:
+            button = Button(self.fig.add_axes(pos), label)
+            button.label.set_fontsize(9)
+            if key in ORIENT_KEYS:
+                button.color = ORIENT_COLORS[key]
+                button.ax.set_facecolor(button.color)
+                button.label.set_color("white")
+            button.on_clicked(callback)
+            self.buttons[key] = button
+        self.fig.text(.23,.012,"Arrows: slices • Shift+arrows: 10 slices • L: labels • ?: help in terminal",fontsize=9)
+        # Matplotlib's default Left/Right history actions conflict with slice keys.
+        handler = getattr(self.fig.canvas.manager, 'key_press_handler_id', None)
+        if handler is not None:
+            self.fig.canvas.mpl_disconnect(handler)
+        for event, callback in (("button_press_event",self._on_click),
+                                ("button_release_event",self._on_release),
+                                ("motion_notify_event",self._on_motion),
+                                ("scroll_event",self._on_scroll),
+                                ("key_press_event",self._on_key)):
+            self.fig.canvas.mpl_connect(event,callback)
+        self.fig.canvas.mpl_connect("resize_event", lambda e:self._update_display())
         self._update_display()
         self._update_diagram()
         self._try_maximize()
+
+    def _toggle_labels(self, _event=None):
+        self.show_point_labels = not self.show_point_labels
+        self.buttons["labels"].label.set_text("Labels " + ("on" if self.show_point_labels else "off") + " (L)")
+        self._update_display()
+
+    def _step_slice(self, delta):
+        self.current_slice = int(np.clip(self.current_slice + delta, 0, self._max_slice(self.current_view)))
+        self.slice_indices[self.current_view] = self.current_slice
+        self._sync_other_slices_from_current()
+        self._set_slider_val(self.current_slice)
+        self._update_display()
+
+    def _pad_panel(self, ax, view):
+        """Letterbox the image inside a fixed panel, preserving physical proportions."""
+        h_axis, v_axis = {"coronal":(0,1),"sagittal":(1,2),"axial":(0,2)}[view]
+        physical_aspect = self.spacing_xyz[v_axis] / self.spacing_xyz[h_axis]
+        box = ax.get_position(original=True)
+        fig_w, fig_h = self.fig.get_size_inches()
+        ratio = box.height * fig_h / (box.width * fig_w) / physical_aspect
+        x0,x1 = ax.get_xlim(); y1,y0 = ax.get_ylim()
+        width, height = x1-x0, y1-y0
+        if height / width < ratio:
+            height = width * ratio
+        else:
+            width = height / ratio
+        cx,cy = (x0+x1)/2,(y0+y1)/2
+        ax.set_aspect("auto")
+        ax.set_xlim(cx-width/2,cx+width/2)
+        ax.set_ylim(cy+height/2,cy-height/2)
 
     def _try_maximize(self) -> None:
         """Best-effort maximize for common Matplotlib backends."""
@@ -539,12 +530,12 @@ class MicroprismCornerTracker:
         # whether the user is in coronal, sagittal, or axial mode.
         self.ax.imshow(self._get_slice_2d(view, sl),
                        cmap="gray", vmin=0, vmax=1,
-                       interpolation="nearest", aspect="equal")
+                       interpolation="nearest", aspect="auto")
         self.ax.axis("off")
 
         # Title — matches midline's 4-line title style
         if self.current_orient >= 3:
-            status = "All points placed — click Save & Quit"
+            status = "All points placed — inspect face, confirm orientation, then save"
             tcol   = "green"
         elif view != active:
             status = (f"Active phase: {ORIENT_NAMES[active]} — "
@@ -576,15 +567,16 @@ class MicroprismCornerTracker:
                 self.ax.add_patch(plt.Circle(
                     (fa, fb), 10, fill=False, edgecolor="#00ffff",
                     linewidth=2.2, zorder=8))
-                self.ax.text(
-                    fa+12, fb-12, f_pid, color="#00ffff", fontsize=10,
-                    fontweight="bold", zorder=9,
-                    bbox=dict(boxstyle="round,pad=0.15",
-                              facecolor="black", edgecolor="#00ffff", alpha=0.65))
+                if self.show_point_labels:
+                    self.ax.text(
+                        fa+12, fb-12, f_pid, color="#00ffff", fontsize=10,
+                        fontweight="bold", zorder=9,
+                        bbox=dict(boxstyle="round,pad=0.15",
+                                  facecolor="black", edgecolor="#00ffff", alpha=0.65))
 
         preview_slots = [
-            [0.735, 0.555, 0.255, 0.370],
-            [0.735, 0.135, 0.255, 0.370],
+            [.745, .625, .24, .295],
+            [.745, .325, .24, .245],
         ]
         visible_previews = [v for v in ORIENT_KEYS if v != view]
         for slot, preview_view in zip(preview_slots, visible_previews):
@@ -612,6 +604,7 @@ class MicroprismCornerTracker:
         self.slider.label.set_text(f"{view.capitalize()} slice")
         self._set_slider_val(sl)
 
+        self.fit_status_text.set_text(self.geometry_status)
         self.fig.canvas.draw_idle()
 
     def _render_view_panel(
@@ -628,11 +621,17 @@ class MicroprismCornerTracker:
         ax.set_facecolor("black")
         ax.imshow(self._get_slice_2d(view, sl),
                   cmap="gray", vmin=0, vmax=1,
-                  interpolation="nearest", aspect="equal")
-        ax.axis("off")
+                  interpolation="nearest", aspect="auto")
+        # Keep the axes patch visible so letterboxing stays black.
+        ax.set_axis_on()
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
         if self.show_overlays:
             self._draw_cross_view_overlays(ax, view, sl, compact=not is_main)
         self._draw_current_view_points(ax, view, sl, compact=not is_main)
+        self._draw_face_preview(ax, view, sl)
         if title:
             ax.set_title(title, fontsize=9, color=ORIENT_COLORS[view], pad=3)
         if apply_zoom:
@@ -641,6 +640,144 @@ class MicroprismCornerTracker:
             width, height = self._display_shape(view)
             ax.set_xlim(-0.5, width - 0.5)
             ax.set_ylim(height - 0.5, -0.5)
+        self._pad_panel(ax, view)
+
+    def load_clicks(self, data):
+        """Restore recorded view/slice clicks; do not synthesize repeated observations."""
+        self.clicks = [[None]*4 for _ in range(3)]
+        for o, view in enumerate(ORIENT_KEYS):
+            for i in range(4):
+                point = data.get("per_orientation", {}).get(view, {}).get(f"P{i+1}")
+                if point:
+                    a,b,sl = self._xyz_to_view_display(view, [point[k] for k in 'xyz'])
+                    self.clicks[o][i] = (a,b,sl)
+        if not any(c is not None for row in self.clicks for c in row):
+            raise ValueError("This file has no per-view clicks to restore.")
+        self.current_orient, self.current_point = 3, 0
+        for o in range(3):
+            for i in range(4):
+                if self.clicks[o][i] is None:
+                    self.current_orient, self.current_point = o, i
+                    break
+            if self.current_orient != 3:
+                break
+        self.confirmed_fit_signature = None
+        points = [self._click_to_xyz(o,c) for o,row in enumerate(self.clicks) for c in row if c is not None]
+        center = np.mean(points,axis=0)
+        for view in ORIENT_KEYS:
+            self.slice_indices[view] = int(np.clip(round(self._xyz_to_view_display(view,center)[2]),0,self._max_slice(view)))
+        self.current_view = ORIENT_KEYS[min(self.current_orient,2)] if self.current_orient<3 else 'coronal'
+        self.current_slice = self.slice_indices[self.current_view]
+
+    def _fit_observations(self):
+        completed = sum(c is not None for row in self.clicks for c in row)
+        if completed != 12:
+            raise ValueError(f"Face preview waits for all 3 views: {completed}/12 clicks. Each corner will use its three-view average.")
+        points = []
+        for i in range(4):
+            values = [self._click_to_xyz(o, self.clicks[o][i]) for o in range(3)
+                      if self.clicks[o][i] is not None]
+            if not values:
+                raise ValueError("Place all four corners to preview the fit.")
+            points.append(np.mean(values, axis=0))
+        return np.asarray(points) * self.spacing_xyz
+
+    def _fit_signature(self):
+        # Any changed click invalidates an earlier orientation confirmation.
+        return (repr(self.clicks), self.fit_branch, self.prism_width_mm,
+                self.prism_length_mm, tuple(self.spacing_xyz))
+
+    def _toggle_method(self, _event):
+        self.derivation_method = "original" if self.derivation_method == "fixed" else "fixed"
+        self.buttons["method"].label.set_text("Method: " + self.derivation_method.title())
+        for key in ("branch", "confirm_fit"):
+            active = self.derivation_method == "fixed"
+            self.buttons[key].set_active(active)
+            self.buttons[key].label.set_color("black" if active else "gray")
+        self._update_display()
+
+    def _toggle_branch(self, _event):
+        self.fit_branch = "B" if self.fit_branch == "A" else "A"
+        self.buttons["branch"].label.set_text("Preview: " + self.fit_branch)
+        self.buttons["confirm_fit"].label.set_text("Use orientation " + self.fit_branch)
+        self._update_display()
+
+    def _confirm_fit(self, _event):
+        if self.derivation_method != "fixed":
+            print("Switch to Method: Fixed to inspect and confirm its orientation.")
+            return
+        try:
+            fit_prism(self._fit_observations(), self.prism_width_mm, self.prism_length_mm)
+            self.confirmed_fit_signature = self._fit_signature()
+        except ValueError as exc:
+            print(exc)
+        self._update_display()
+
+    def _method_results(self, green):
+        original = self._derive_imaging_face(green)
+        original_face = {k: v for k, v in original.items() if not k.startswith("_")}
+        methods = {"original": {"imaging_face_points": original_face,
+                                 "diagnostics": original.get("_diagnostics", {})}}
+        try:
+            fit = fit_prism(self._fit_observations(), self.prism_width_mm, self.prism_length_mm)
+            fit["per_corner_displacement_voxels"] = np.linalg.norm(
+                (np.asarray(fit["fitted_clicked_mm"]) - np.asarray(fit["input_clicked_mm"])) / self.spacing_xyz, axis=1).tolist()
+            candidates = {b: face_records(f, self.spacing_xyz)
+                          for b, f in fit["candidates_mm"].items()}
+            confirmed = self.confirmed_fit_signature == self._fit_signature()
+            methods["fixed"] = {"candidates": candidates, "diagnostics": fit,
+                                "selected_branch": self.fit_branch if confirmed else None,
+                                "imaging_face_points": candidates[self.fit_branch] if confirmed else None}
+        except ValueError as exc:
+            methods["fixed"] = {"error": str(exc), "selected_branch": None}
+        return methods
+
+    def _draw_face_preview(self, ax, view, sl):
+        try:
+            raw = self._fit_observations()
+            if self.derivation_method == "fixed":
+                fit = fit_prism(raw, self.prism_width_mm, self.prism_length_mm)
+                face = np.asarray(fit["candidates_mm"][self.fit_branch]) / self.spacing_xyz
+                fitted = np.asarray(fit["fitted_clicked_mm"]) / self.spacing_xyz
+                color = "#00e5cc"
+                confirmed = self.confirmed_fit_signature == self._fit_signature()
+                errors = ", ".join(f"{e:.3f}" for e in fit["per_corner_error_mm"])
+                self.geometry_status = (f"Equal-leg prism | {self.prism_width_mm:g} × {self.prism_length_mm:g} mm | "
+                    f"{self.fit_branch}: {'confirmed' if confirmed else 'choose orientation before saving'}\n"
+                    f"P1–P4 errors: {errors} mm | RMS {fit['rms_error_mm']:.3f} mm | dashed: projection; solid: slice intersection")
+            else:
+                green = {f"P{i+1}": self._average_point(i) for i in range(4)}
+                result = self._derive_imaging_face(green)
+                keys = ('shared_left_P1','shared_right_P2','derived_left','derived_right')
+                if any(result.get(k) is None for k in keys):
+                    raise ValueError("Original method cannot solve these dimensions/clicks.")
+                face = np.array([[result[k][a] for a in 'xyz'] for k in keys])
+                fitted = raw / self.spacing_xyz
+                color = "#ffae42"
+                self.geometry_status = "Original triangles: smallest-Z-change branch | dashed: projected face (may be nonplanar)"
+            for source, target in zip(raw / self.spacing_xyz, fitted):
+                a = self._xyz_to_view_display(view, source)
+                b = self._xyz_to_view_display(view, target)
+                ax.plot([a[0],b[0]], [a[1],b[1]], color=color, linewidth=.7)
+                ax.plot(a[0], a[1], 'x', color='white', markersize=4)
+                ax.plot(b[0], b[1], '+', color=color, markersize=5)
+            polygon = face[[0,1,3,2]]
+            projected = np.array([self._xyz_to_view_display(view, p)[:2] for p in polygon])
+            closed = np.vstack([projected, projected[0]])
+            ax.plot(closed[:,0], closed[:,1], '--', color=color, linewidth=1.5)
+            for label, point in zip(('P1 fit','P2 fit','D1','D2') if self.derivation_method == "fixed" else ('P1','P2','D1','D2'), face):
+                a,b,_ = self._xyz_to_view_display(view, point)
+                if self.show_point_labels:
+                    ax.text(a,b,label, color=color, fontsize=7)
+            if self.derivation_method == "fixed":
+                axis = {'coronal':2,'sagittal':0,'axial':1}[view]
+                intersection = slice_intersection(polygon, axis, sl)
+                if len(intersection) >= 2:
+                    coords = np.array([self._xyz_to_view_display(view,p)[:2] for p in intersection])
+                    if len(coords)>2: coords = np.vstack([coords,coords[0]])
+                    ax.plot(coords[:,0],coords[:,1], color=color, linewidth=3)
+        except ValueError as exc:
+            self.geometry_status = str(exc)
 
     def _draw_current_view_points(self, ax, view: str, sl: int, compact: bool = False) -> None:
         """Draw saved points from the active view and highlight the exact pixel."""
@@ -688,7 +825,7 @@ class MicroprismCornerTracker:
                 ax.add_patch(plt.Circle(
                     (a, b), 5 if compact else 7, fill=False, linestyle="--",
                     edgecolor=color, linewidth=1.6, alpha=alpha, zorder=5))
-                if not compact:
+                if not compact and self.show_point_labels:
                     ax.text(
                         a + 9, b + 9,
                         f"{source_view[:3]} {POINT_DEFS[p_idx]['id']} s={target_slice:.0f}",
@@ -719,7 +856,7 @@ class MicroprismCornerTracker:
         ax.add_patch(plt.Circle(
             (a, b), 5 if compact else 8, fill=False, edgecolor=color,
             linewidth=1.8, alpha=alpha, zorder=zorder))
-        if not compact:
+        if not compact and self.show_point_labels:
             ax.text(
                 a + 10, b - 10, label, color=color, fontsize=8.5,
                 fontweight="bold", alpha=alpha, zorder=zorder + 3,
@@ -779,9 +916,13 @@ class MicroprismCornerTracker:
         placed = sum(c is not None for row in self.clicks for c in row)
         lines.append(f"Total {placed}/12")
 
-        self.ax_list.text(0.05, 0.64, "\n".join(lines),
+        fig_w, fig_h = self.fig.get_size_inches()
+        box = self.ax_list.get_position(original=True)
+        table_font = min(9.0, fig_h * box.height * 72 * .63 / (len(lines) * 1.25),
+                         fig_w * box.width * 72 * .9 / (max(map(len, lines)) * .62))
+        self.ax_list.text(0.05, 0.70, "\n".join(lines),
                           transform=self.ax_list.transAxes,
-                          ha="left", va="top", fontsize=9.0, color="#333",
+                          ha="left", va="top", fontsize=table_font, color="#333",
                           family="monospace", linespacing=1.03)
 
     # ─────────────────────────────────────────────────────────────────────
@@ -908,6 +1049,8 @@ class MicroprismCornerTracker:
             print(f"  Switch to {ORIENT_NAMES[active]} to place next point.")
             return
 
+        if not self._display_point_in_bounds(self.current_view, event.xdata, event.ydata):
+            return  # black letterboxing is not part of the scan
         a, b = int(round(event.xdata)), int(round(event.ydata))
         a, b = self._clamp(self.current_view, a, b)
         self.zoom_center = (float(a), float(b))
@@ -930,7 +1073,7 @@ class MicroprismCornerTracker:
                       f"{ORIENT_NAMES[nv]}")
                 print(f"     Click [{nv.capitalize()}] button to switch")
             else:
-                print("\n  ✓ All 12 clicks done — click Save & Quit")
+                print("\n  ✓ All 12 clicks done — inspect both candidates and confirm orientation before saving")
 
         self._save_warned = False
         self._update_display()
@@ -1019,19 +1162,14 @@ class MicroprismCornerTracker:
             self._switch_view("sagittal")
         elif k == "a":
             self._switch_view("axial")
-        elif k in ("right", "up"):
-            self.current_slice = min(
-                self.current_slice + 1, self._max_slice(self.current_view))
-            self.slice_indices[self.current_view] = self.current_slice
-            self._sync_other_slices_from_current()
-            self._set_slider_val(self.current_slice)
-            self._update_display()
-        elif k in ("left", "down"):
-            self.current_slice = max(self.current_slice - 1, 0)
-            self.slice_indices[self.current_view] = self.current_slice
-            self._sync_other_slices_from_current()
-            self._set_slider_val(self.current_slice)
-            self._update_display()
+        elif k in ("right", "up", "shift+right", "shift+up"):
+            self._step_slice(10 if k.startswith("shift+") else 1)
+        elif k in ("left", "down", "shift+left", "shift+down"):
+            self._step_slice(-10 if k.startswith("shift+") else -1)
+        elif k == "l":
+            self._toggle_labels()
+        elif k in ("?", "h", "f1"):
+            self._print_instructions()
         elif k == "u":
             self._on_undo(None)
         elif k in ("o",):
@@ -1096,12 +1234,10 @@ class MicroprismCornerTracker:
         self._switch_view(active)
 
     def _on_save(self, _e) -> None:
-        """Save results, warning once before allowing a partial/incomplete save."""
+        """Require complete three-view averages and a confirmed fixed-fit orientation."""
         placed = sum(c is not None for row in self.clicks for c in row)
-        if placed < 12 and not self._save_warned:
-            print(f"  WARNING: {placed}/12 clicks placed. "
-                  "Click Save & Quit again to confirm partial save.")
-            self._save_warned = True
+        if placed < 12:
+            print(f"  {placed}/12 clicks placed. Complete all three views before saving an averaged imaging face.")
             return
         try:
             self._save_results()
@@ -1121,17 +1257,17 @@ class MicroprismCornerTracker:
                 "axial": self.ny-1}[view]
 
     def _get_slice_2d(self, view: str, idx: int) -> np.ndarray:
-        """Extract the 2D image displayed for a view/slice combination."""
-        if view == "coronal":   return self.img_disp[idx, :, :]
-        if view == "sagittal":  return self.img_disp[:, :, idx]
-        if view == "axial":     return self.img_disp[:, idx, :]
-        raise ValueError(view)
+        if view == "coronal": array = self.image[idx, :, :]
+        elif view == "sagittal": array = self.image[:, :, idx]
+        elif view == "axial": array = self.image[:, idx, :]
+        else: raise ValueError(view)
+        lo, hi = self.display_limits
+        return np.clip((np.asarray(array, dtype=np.float32) - lo) / max(hi - lo, 1e-8), 0, 1)
 
     def _display_shape(self, view: str) -> Tuple[int, int]:
-        """Return displayed slice width/height for a view."""
-        arr = self._get_slice_2d(view, self.current_slice)
-        height, width = arr.shape
-        return int(width), int(height)
+        # Do not index another orientation with the active view's slice number.
+        return {"coronal": (self.nx, self.ny), "sagittal": (self.ny, self.nz),
+                "axial": (self.nx, self.nz)}[view]
 
     def _sync_other_slices_from_current(self) -> None:
         """Move preview slices to the same relative depth as the active view."""
@@ -1544,6 +1680,8 @@ class MicroprismCornerTracker:
 
     def _save_results(self) -> None:
         """Write JSON + CSV outputs and print a terminal summary."""
+        if any(c is None for row in self.clicks for c in row):
+            raise ValueError("Complete all 12 clicks before saving a three-view averaged face.")
         # ── Build data ────────────────────────────────────────────────────
         per = {}
         clicked_points_list = self._ordered_click_rows(include_empty=False)
@@ -1566,7 +1704,12 @@ class MicroprismCornerTracker:
 
         green = {pdef["id"]: self._average_point(i)
                  for i,pdef in enumerate(POINT_DEFS)}
-        imaging_face = self._derive_imaging_face(green)
+        methods = self._method_results(green)
+        selected = methods[self.derivation_method]
+        if self.derivation_method == "fixed" and not selected.get("selected_branch"):
+            raise ValueError(selected.get("error", "Inspect candidates A/B and click Use orientation before saving."))
+        imaging_face = dict(selected["imaging_face_points"])
+        imaging_face["_diagnostics"] = selected.get("diagnostics", {})
         imaging_face_points = {
             key: value
             for key, value in imaging_face.items()
@@ -1613,13 +1756,19 @@ class MicroprismCornerTracker:
             "imaging_face_diagnostics": imaging_face.get("_diagnostics", {}),
             "per_orientation": per,
         }
+        json_output.update(schema_version=2, derivation_methods=methods,
+                           selected_method=self.derivation_method,
+                           prism_depth_mm=self.prism_length_mm,
+                           geometry_assumption="equal-leg right prism: depth equals imaging-face length")
+        if self.derivation_method == "fixed":
+            json_output["imaging_face_math"] = "Rigid physical fit to P1–P4; fixed width/height/depth; explicit orientation selection."
         json_path = self.output_dir / "microprism_corners.json"
-        with open(json_path, "w") as f:
+        with open(json_path, "w", encoding="utf-8") as f:
             json.dump(json_output, f, indent=2)
 
         # ── Save CSV ──────────────────────────────────────────────────────
         csv_path = self.output_dir / "microprism_corners.csv"
-        with open(csv_path, "w", newline="") as f:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             # Header
             writer.writerow([
@@ -1705,7 +1854,7 @@ class MicroprismCornerTracker:
                     "", "", "",
                     point["num_orientation_clicks"],
                 ])
-        for point_id in ("derived_left", "derived_right"):
+        for point_id in ("shared_left_P1", "shared_right_P2", "derived_left", "derived_right"):
             point = imaging_face.get(point_id)
             if point:
                 xlsx_rows.append([
@@ -1742,27 +1891,9 @@ class MicroprismCornerTracker:
         print("="*65)
 
     def _print_instructions(self) -> None:
-        print("\n" + "="*72)
-        print("INSTRUCTIONS")
-        print("="*72)
-        print("  [Coronal] [Sagittal] [Axial] buttons (or C/S/A keys) switch views.")
-        print("  Phase 1 — Coronal:  click P1 → P2 → P3 → P4")
-        print("  Phase 2 — Sagittal: click P1 → P2 → P3 → P4")
-        print("  Phase 3 — Axial:    click P1 → P2 → P3 → P4")
-        print()
-        print("  Check the coordinate table as you go: P1-P4 should be relatively")
-        print("  consistent across Coronal, Sagittal, and Axial for the same corner.")
-        print()
-        print("  Slider / scroll wheel / ←→ arrows — navigate slices")
-        print("  Smaller side panels show the other two views at the same relative slice depth")
-        print("  Zoom buttons or +/- keys — zoom in/out for pixel-level clicking")
-        print("  Pan button or P — when zoomed, click-drag the image instead of placing a point")
-        print("  Show overlays / O — project prior-view clicks into the current view")
-        print("  Yellow one-pixel square = exact saved pixel center")
-        print("  U — undo last point    Enter — save & quit")
-        print()
-        print("  Output: microprism_corners.json + microprism_corners.csv")
-        print("="*72 + "\n")
+        from prism_ui_help import TRACKER_HELP, guide_location
+        print(TRACKER_HELP)
+        print(f"Complete controls and visual reference: {guide_location()}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1791,6 +1922,7 @@ def parse_args():
                    help="Microprism width W in mm. If omitted, you will be prompted.")
     p.add_argument("--prism-length", type=float, default=None,
                    help="Microprism length l in mm. If omitted, you will be prompted.")
+    p.add_argument("--load-corners", help="Reopen saved per-view clicks for fitting and comparison.")
     p.add_argument("--no-maximize", action="store_true")
     return p.parse_args()
 
@@ -1799,6 +1931,16 @@ def main() -> None:
     """Choose the input TIFF, create the tracker object, and open the UI."""
     args         = parse_args()
     project_path = resolve_project_path(args.project_path)
+    saved = json.loads(Path(args.load_corners).expanduser().read_text(encoding="utf-8")) if args.load_corners else None
+    if saved:
+        if args.image is None:
+            args.image = saved.get("source_image")
+        if args.prism_width is None:
+            args.prism_width = saved.get("prism_width_mm")
+        if args.prism_length is None:
+            args.prism_length = saved.get("prism_length_mm")
+        if all(getattr(args, name) is None for name in ("spacing", "spacing_x", "spacing_y", "spacing_z")):
+            args.spacing_x, args.spacing_y, args.spacing_z = saved.get("spacing_mm_xyz", [saved.get("spacing_mm", DEFAULT_SPACING)]*3)
     image_path   = find_best_microct_image(
         project_path, Path(args.image) if args.image else None)
     output_dir   = (Path(args.output) if args.output
@@ -1818,7 +1960,7 @@ def main() -> None:
     spacing_xyz_mm = spacing_xyz_from_args(args, image_path)
     spacing_mm = float(np.mean(spacing_xyz_mm))
 
-    MicroprismCornerTracker(
+    tracker = MicroprismCornerTracker(
         microct_image_path=image_path,
         output_dir=output_dir,
         spacing_mm=spacing_mm,
@@ -1826,7 +1968,10 @@ def main() -> None:
         prism_width_mm=prism_width_mm,
         prism_length_mm=prism_length_mm,
         maximize=not args.no_maximize,
-    ).start()
+    )
+    if saved:
+        tracker.load_clicks(saved)
+    tracker.start()
 
 
 if __name__ == "__main__":

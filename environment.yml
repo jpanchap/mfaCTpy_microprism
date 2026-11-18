@@ -1,0 +1,9 @@
+name: mfaCT
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - tk
+  - pip:
+      - -r requirements.txt

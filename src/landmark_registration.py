@@ -4,6 +4,8 @@ Interactive tool for manual landmark selection and registration
 Assumes image orientation has been corrected by midline alignment
 """
 
+from __future__ import annotations
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, Slider
@@ -18,12 +20,12 @@ from project_paths import resolve_project_path
 
 class LandmarkSelector:
     """Interactive landmark selection tool with performance optimizations"""
-    
-    def __init__(self, moving_image, fixed_image, moving_name="MicroCT", 
+
+    def __init__(self, moving_image, fixed_image, moving_name="MicroCT",
                  fixed_name="Allen CCF"):
         """
         Initialize landmark selector
-        
+
         Parameters:
         -----------
         moving_image : numpy.ndarray
@@ -39,28 +41,28 @@ class LandmarkSelector:
         self.fixed_image = fixed_image
         self.moving_name = moving_name
         self.fixed_name = fixed_name
-        
+
         # Landmarks: list of (z, y, x) coordinates
         self.moving_landmarks = []
         self.fixed_landmarks = []
         self.landmark_names = []
-        
+
         # Store plot objects for efficient updates
         self.moving_plots = []
         self.fixed_plots = []
-        
+
         # Current slice indices
         self.moving_slice = moving_image.shape[0] // 2
         self.fixed_slice = fixed_image.shape[0] // 2
-        
+
         # Current view - use simple axis names
         self.view = 'Z'  # Default to Z-axis slicing
-        
+
         # Figure elements
         self.fig = None
         self.ax_moving = None
         self.ax_fixed = None
-        
+
         # Store image artists to update data directly for performance
         self.im_moving = None
         self.im_fixed = None
@@ -72,7 +74,7 @@ class LandmarkSelector:
 
     def get_slice(self, image, slice_idx, view='Z'):
         """Get 2D slice from 3D image based on view
-        
+
         Image convention: (Z, Y, X)
         View indicates which axis we're slicing through
         """
@@ -85,7 +87,7 @@ class LandmarkSelector:
         elif view == 'X':
             # Slice through X axis, shows Z-Y plane
             return image[:, :, slice_idx]
-    
+
     def get_max_slice(self, image, view):
         """Get maximum slice index for given view"""
         if view == 'Z':
@@ -94,6 +96,14 @@ class LandmarkSelector:
             return image.shape[1] - 1
         elif view == 'X':
             return image.shape[2] - 1
+
+    def step_slice(self, panel, step):
+        """Move one panel's slider without wrapping past either volume boundary."""
+        image = self.moving_image if panel == 'moving' else self.fixed_image
+        slider = self.slider_moving if panel == 'moving' else self.slider_fixed
+        index = int(np.clip(slider.val + step, 0, self.get_max_slice(image, self.view)))
+        if index != slider.val:
+            slider.set_val(index)
 
     def get_display_shape(self, image, view):
         """Return displayed slice width/height for a view."""
@@ -240,7 +250,7 @@ class LandmarkSelector:
         ymax = ymin + 2 * half_h
         axes.set_xlim(xmin, xmax)
         axes.set_ylim(ymax, ymin)
-    
+
     def onclick(self, event):
         """Handle mouse clicks for landmark selection"""
         if event.inaxes is None or event.button != 1:
@@ -254,9 +264,9 @@ class LandmarkSelector:
         if self.pan_mode:
             self.begin_pan(event)
             return
-        
+
         x, y = int(event.xdata), int(event.ydata)
-        
+
         if event.inaxes == self.ax_moving:
             self.zoom_center["moving"] = (float(x), float(y))
             # Convert 2D click to 3D coordinate based on current view
@@ -266,25 +276,25 @@ class LandmarkSelector:
                 landmark = (y, self.moving_slice, x)  # (Z, Y, X)
             else:  # X
                 landmark = (y, x, self.moving_slice)  # (Z, Y, X)
-            
+
             self.moving_landmarks.append(landmark)
             landmark_id = len(self.moving_landmarks)
             print(f"Moving landmark {landmark_id}: {landmark} (Z, Y, X)")
             print(f"  Waiting for corresponding point in {self.fixed_name}...")
-            
+
             # Create and store plot objects
             marker = self.ax_moving.plot(x, y, 'r+', markersize=15, markeredgewidth=2)[0]
-            text = self.ax_moving.text(x+5, y-5, str(landmark_id), 
+            text = self.ax_moving.text(x+5, y-5, str(landmark_id),
                                        color='red', fontsize=12, fontweight='bold',
                                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
             self.moving_plots.append({'marker': marker, 'text': text})
-            
+
         elif event.inaxes == self.ax_fixed:
             self.zoom_center["fixed"] = (float(x), float(y))
             if len(self.fixed_landmarks) >= len(self.moving_landmarks):
                 print("WARNING: Select a point on the moving image first!")
                 return
-            
+
             # Convert 2D click to 3D coordinate based on current view
             if self.view == 'Z':
                 landmark = (self.fixed_slice, y, x)  # (Z, Y, X)
@@ -302,7 +312,7 @@ class LandmarkSelector:
 
             # Create and store plot objects
             marker = self.ax_fixed.plot(x, y, 'g+', markersize=15, markeredgewidth=2)[0]
-            text = self.ax_fixed.text(x+5, y-5, str(landmark_id), 
+            text = self.ax_fixed.text(x+5, y-5, str(landmark_id),
                                       color='green', fontsize=12, fontweight='bold',
                                       bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
             self.fixed_plots.append({'marker': marker, 'text': text})
@@ -314,13 +324,20 @@ class LandmarkSelector:
         # Update image data
         moving_slice_data = self.get_slice(self.moving_image, self.moving_slice, self.view)
         fixed_slice_data = self.get_slice(self.fixed_image, self.fixed_slice, self.view)
-        
+
         self.im_moving.set_data(moving_slice_data)
         self.im_fixed.set_data(fixed_slice_data)
-        
+        # set_data does not update the extent when a new plane has a different shape.
+        # Keep pixel centers in voxel coordinates so clicks and overlays stay accurate.
+        for artist, data in ((self.im_moving, moving_slice_data),
+                             (self.im_fixed, fixed_slice_data)):
+            height, width = data.shape
+            artist.set_extent((-0.5, width - 0.5, height - 0.5, -0.5))
+            artist.axes.set_aspect('equal', adjustable='box')
+
         self.im_moving.set_clim(vmin=moving_slice_data.min(), vmax=moving_slice_data.max())
         self.im_fixed.set_clim(vmin=fixed_slice_data.min(), vmax=fixed_slice_data.max())
-        
+
         # Determine plane description
         if self.view == 'Z':
             plane_desc = 'Y-X plane'
@@ -328,7 +345,7 @@ class LandmarkSelector:
             plane_desc = 'Z-X plane'
         else:  # X
             plane_desc = 'Z-Y plane'
-        
+
         # Update titles
         title_moving = (
             f"{self.moving_name}\n"
@@ -339,7 +356,7 @@ class LandmarkSelector:
             f"landmarks {len(self.moving_landmarks)}"
         )
         self.ax_moving.set_title(title_moving, fontsize=9, pad=8)
-        
+
         title_fixed = (
             f"{self.fixed_name}\n"
             f"{plane_desc} | slice {self.fixed_slice}/"
@@ -371,7 +388,7 @@ class LandmarkSelector:
 
         # Show unpaired landmark warning
         if len(self.moving_landmarks) > len(self.fixed_landmarks):
-            self.ax_fixed.text(0.5, 0.98, 
+            self.ax_fixed.text(0.5, 0.98,
                              'WARNING: Click to pair with moving landmark!',
                              transform=self.ax_fixed.transAxes,
                              color='yellow', fontsize=12, fontweight='bold',
@@ -389,25 +406,25 @@ class LandmarkSelector:
             self.fixed_landmarks.pop()
             if self.landmark_names:
                 self.landmark_names.pop()
-            
+
             plots_mov = self.moving_plots.pop()
             plots_fix = self.fixed_plots.pop()
             plots_mov['marker'].remove()
             plots_mov['text'].remove()
             plots_fix['marker'].remove()
             plots_fix['text'].remove()
-            
+
             print("Removed last landmark pair")
-            
+
         elif self.moving_landmarks:
             self.moving_landmarks.pop()
             plots_mov = self.moving_plots.pop()
             plots_mov['marker'].remove()
             plots_mov['text'].remove()
             print("Removed unpaired moving landmark")
-            
+
         self.update_display()
-        
+
     def select_landmarks(self):
         """Launch interactive landmark selection interface"""
         print("\n" + "="*70)
@@ -440,10 +457,10 @@ class LandmarkSelector:
         print("  - 'l': List all landmarks")
         print("  - 'Enter': Done")
         print("="*70 + "\n")
-        
+
         self.fig = plt.figure(figsize=(18, 10))
         self.fig.subplots_adjust(left=0.04, right=0.96, top=0.88, bottom=0.08)
-        
+
         # Adjust layout to leave more space at bottom for controls
         # Images sit below the title band and above sliders/buttons.
         self.ax_moving = plt.axes([0.06, 0.34, 0.40, 0.52])
@@ -452,59 +469,72 @@ class LandmarkSelector:
         # Create imshow artists once for performance
         moving_slice_data = self.get_slice(self.moving_image, self.moving_slice, self.view)
         fixed_slice_data = self.get_slice(self.fixed_image, self.fixed_slice, self.view)
-        
+
         self.im_moving = self.ax_moving.imshow(moving_slice_data, cmap='gray')
         self.im_fixed = self.ax_fixed.imshow(fixed_slice_data, cmap='gray')
-        
+
         self.ax_moving.axis('off')
         self.ax_fixed.axis('off')
 
         # Add sliders - positioned below the images
         ax_slider_moving = plt.axes([0.14, 0.235, 0.27, 0.025])
         ax_slider_fixed = plt.axes([0.64, 0.235, 0.27, 0.025])
-        
+
         max_moving = self.get_max_slice(self.moving_image, self.view)
         max_fixed = self.get_max_slice(self.fixed_image, self.view)
-        
+
         self.slider_moving = Slider(
-            ax_slider_moving, 
+            ax_slider_moving,
             f'Moving {self.view}',
-            0, 
-            max_moving,
+            0,
+            max(1, max_moving),
             valinit=self.moving_slice,
             valstep=1
         )
-        
+
         self.slider_fixed = Slider(
             ax_slider_fixed,
             f'Fixed {self.view}',
             0,
-            max_fixed,
+            max(1, max_fixed),
             valinit=self.fixed_slice,
             valstep=1
         )
-        
+
+        self.slider_moving.valmax = max_moving
+        self.slider_fixed.valmax = max_fixed
+        self.slider_moving.set_active(max_moving > 0)
+        self.slider_fixed.set_active(max_fixed > 0)
+
         def update_moving_slice(val):
             self.moving_slice = int(self.slider_moving.val)
             self.update_display()
-        
+
         def update_fixed_slice(val):
             self.fixed_slice = int(self.slider_fixed.val)
             self.update_display()
-        
+
         self.slider_moving.on_changed(update_moving_slice)
         self.slider_fixed.on_changed(update_fixed_slice)
         self.slider_moving.label.set_fontsize(9)
         self.slider_fixed.label.set_fontsize(9)
         self.slider_moving.valtext.set_fontsize(9)
         self.slider_fixed.valtext.set_fontsize(9)
-        
+
+        # Independent one-slice navigation above each existing slider.
+        self.slice_buttons = []
+        for panel, left in (("moving", 0.14), ("fixed", 0.64)):
+            for offset, step, label in ((0, -1, '◀'), (0.065, 1, '▶')):
+                button = Button(plt.axes([left + offset, 0.28, 0.055, 0.03]), label)
+                button.on_clicked(lambda event, p=panel, d=step: self.step_slice(p, d))
+                self.slice_buttons.append(button)
+
         # Add buttons - positioned at the bottom
         # Row 1: View controls
         ax_view_z = plt.axes([0.14, 0.145, 0.075, 0.04])
         ax_view_y = plt.axes([0.225, 0.145, 0.075, 0.04])
         ax_view_x = plt.axes([0.31, 0.145, 0.075, 0.04])
-        
+
         # Row 2: Action buttons
         ax_list = plt.axes([0.54, 0.145, 0.075, 0.04])
         ax_undo = plt.axes([0.625, 0.145, 0.075, 0.04])
@@ -518,7 +548,7 @@ class LandmarkSelector:
         ax_zoom_fixed_out = plt.axes([0.172, 0.035, 0.08, 0.036])
         ax_zoom_fixed_reset = plt.axes([0.264, 0.035, 0.08, 0.036])
         ax_pan = plt.axes([0.38, 0.06, 0.095, 0.04])
-        
+
         btn_view_z = Button(ax_view_z, 'Z-axis')
         btn_view_y = Button(ax_view_y, 'Y-axis')
         btn_view_x = Button(ax_view_x, 'X-axis')
@@ -537,7 +567,7 @@ class LandmarkSelector:
             btn_zoom_fixed_in, btn_zoom_fixed_out, btn_zoom_fixed_reset,
         ):
             button.label.set_fontsize(9)
-        
+
         def on_done(event):
             if len(self.moving_landmarks) != len(self.fixed_landmarks):
                 print("\nWARNING: Unpaired landmarks detected!")
@@ -545,7 +575,7 @@ class LandmarkSelector:
                 print("  Please complete or undo the last landmark.")
                 return
             plt.close(self.fig)
-        
+
         def on_list(event):
             print("\n" + "="*60)
             print("CURRENT LANDMARKS")
@@ -558,27 +588,29 @@ class LandmarkSelector:
             if len(self.moving_landmarks) > len(self.fixed_landmarks):
                 print(f"\nWARNING: Unpaired moving landmark: {self.moving_landmarks[-1]}")
             print("="*60 + "\n")
-        
+
         def change_view(new_view):
             self.view = new_view
             max_mov = self.get_max_slice(self.moving_image, self.view)
             max_fix = self.get_max_slice(self.fixed_image, self.view)
-            
+
             self.moving_slice = max_mov // 2
             self.fixed_slice = max_fix // 2
             self.zoom_factor = {"moving": 1.0, "fixed": 1.0}
             self.zoom_center = {"moving": None, "fixed": None}
-            
-            self.slider_moving.valmin = 0
-            self.slider_moving.valmax = max_mov
-            self.slider_moving.set_val(self.moving_slice)
-            self.slider_moving.label.set_text(f'Moving {self.view}')
-            
-            self.slider_fixed.valmin = 0
-            self.slider_fixed.valmax = max_fix
-            self.slider_fixed.set_val(self.fixed_slice)
-            self.slider_fixed.label.set_text(f'Fixed {self.view}')
-            
+
+            for slider, maximum, index, label in (
+                (self.slider_moving, max_mov, self.moving_slice, 'Moving'),
+                (self.slider_fixed, max_fix, self.fixed_slice, 'Fixed'),
+            ):
+                slider.eventson = False
+                slider.valmin, slider.valmax = 0, maximum
+                slider.ax.set_xlim(0, max(1, maximum))
+                slider.set_val(index)
+                slider.label.set_text(f'{label} {self.view}')
+                slider.set_active(maximum > 0)
+                slider.eventson = True
+
             print(f"\nSwitched to {self.view}-axis view")
             self.update_display()
 
@@ -589,7 +621,7 @@ class LandmarkSelector:
 
         def on_pan(event):
             set_pan_mode(not self.pan_mode)
-        
+
         btn_done.on_clicked(on_done)
         btn_undo.on_clicked(self.on_undo)
         btn_list.on_clicked(on_list)
@@ -603,7 +635,7 @@ class LandmarkSelector:
         btn_zoom_fixed_out.on_clicked(lambda e: self.change_zoom("fixed", 1/1.5))
         btn_zoom_fixed_reset.on_clicked(lambda e: self.reset_zoom("fixed"))
         btn_pan.on_clicked(on_pan)
-        
+
         # Connect events
         self.fig.canvas.mpl_connect('button_press_event', self.onclick)
 
@@ -616,7 +648,7 @@ class LandmarkSelector:
 
         self.fig.canvas.mpl_connect('motion_notify_event', on_motion)
         self.fig.canvas.mpl_connect('button_release_event', self.end_pan)
-        
+
         def on_scroll(event):
             if event.inaxes == self.ax_moving:
                 self.active_panel = "moving"
@@ -647,9 +679,9 @@ class LandmarkSelector:
                     self.fixed_slice = max(self.fixed_slice - 1, 0)
                 self.slider_fixed.set_val(self.fixed_slice)
             self.update_display()
-        
+
         self.fig.canvas.mpl_connect('scroll_event', on_scroll)
-        
+
         # Add keyboard shortcuts
         def on_key(event):
             if event.key == 'u':
@@ -672,20 +704,20 @@ class LandmarkSelector:
                 self.reset_zoom(self.active_panel)
             elif event.key == 'p':
                 set_pan_mode(not self.pan_mode)
-        
+
         self.fig.canvas.mpl_connect('key_press_event', on_key)
-        
+
         # Call update_display once to set initial titles
         self.update_display()
-        
+
         plt.show()
-        
+
         print(f"\n✓ Selected {len(self.fixed_landmarks)} complete landmark pairs")
         if len(self.moving_landmarks) != len(self.fixed_landmarks):
             print(f"WARNING: {len(self.moving_landmarks) - len(self.fixed_landmarks)} unpaired landmarks")
-        
+
         return self.moving_landmarks, self.fixed_landmarks
-    
+
     def save_landmarks(self, filepath):
         """Save landmarks to JSON file"""
         data = {
@@ -697,40 +729,40 @@ class LandmarkSelector:
             'num_pairs': len(self.fixed_landmarks),
             'coordinate_convention': 'Z, Y, X'
         }
-        
-        with open(filepath, 'w') as f:
+
+        with open(filepath, 'w', encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        
+
         print(f"✓ Landmarks saved to: {filepath}")
-    
+
     def load_landmarks(self, filepath):
         """Load landmarks from JSON file"""
-        with open(filepath, 'r') as f:
+        with open(filepath, 'r', encoding="utf-8") as f:
             data = json.load(f)
-        
+
         self.moving_landmarks = [tuple(lm) for lm in data['moving_landmarks']]
         self.fixed_landmarks = [tuple(lm) for lm in data['fixed_landmarks']]
         self.landmark_names = data.get('landmark_names', [])
-        
+
         print(f"✓ Loaded {len(self.fixed_landmarks)} landmark pairs from: {filepath}")
         return self.moving_landmarks, self.fixed_landmarks
 
 
 class LandmarkRegistration:
     """Perform registration based on landmarks with enhanced options"""
-    
+
     def __init__(self, project_path):
         """Initialize registration"""
         self.project_path = Path(project_path)
         self.output_path = self.project_path / "outputs"
         self.output_path.mkdir(exist_ok=True)
-    
+
     def numpy_to_sitk(self, image_array, spacing=(1.0, 1.0, 1.0)):
         """Convert numpy array to SimpleITK image"""
         image_sitk = sitk.GetImageFromArray(image_array.astype(np.float32))
         image_sitk.SetSpacing(spacing)
         return image_sitk
-    
+
     def compute_landmark_error(self, moving_landmarks, fixed_landmarks, transform,
                               moving_spacing, fixed_spacing):
         """Compute registration error for each landmark pair"""
@@ -744,7 +776,7 @@ class LandmarkRegistration:
                 "WARNING: could not invert registration transform for landmark "
                 "error calculation. Reporting fixed-to-moving error instead."
             )
-        
+
         for m_lm, f_lm in zip(moving_landmarks, fixed_landmarks):
             # Convert from (Z,Y,X) to physical coordinates (x,y,z)
             m_phys = [m_lm[2] * moving_spacing[0],  # X
@@ -753,7 +785,7 @@ class LandmarkRegistration:
             f_phys = [f_lm[2] * fixed_spacing[0],   # X
                      f_lm[1] * fixed_spacing[1],    # Y
                      f_lm[0] * fixed_spacing[2]]    # Z
-            
+
             if moving_to_fixed is not None:
                 # The transform used by Resample maps fixed/output points into
                 # moving/input space. Invert it to compare moving landmarks in
@@ -768,17 +800,17 @@ class LandmarkRegistration:
                 sum((m_transformed[i] - reference[i])**2 for i in range(3))
             )
             errors.append(error)
-        
+
         return np.array(errors)
-    
-    def landmark_registration(self, moving_image, fixed_image, 
+
+    def landmark_registration(self, moving_image, fixed_image,
                             moving_landmarks, fixed_landmarks,
                             moving_spacing=(0.025, 0.025, 0.025),
                             fixed_spacing=(0.025, 0.025, 0.025),
                             transform_type='affine'):
         """
         Perform landmark-based registration
-        
+
         Parameters:
         -----------
         moving_image : numpy.ndarray
@@ -795,7 +827,7 @@ class LandmarkRegistration:
             Voxel spacing in mm (for X, Y, Z directions)
         transform_type : str
             'affine', 'similarity', or 'rigid'
-            
+
         Returns:
         --------
         tuple : (registered_image, transform, metrics)
@@ -807,39 +839,39 @@ class LandmarkRegistration:
         print(f"Transform type: {transform_type.upper()}")
         print(f"Moving image shape (Z,Y,X): {moving_image.shape}")
         print(f"Fixed image shape (Z,Y,X): {fixed_image.shape}")
-        
+
         min_landmarks = {'rigid': 3, 'similarity': 3, 'affine': 4}
         if len(moving_landmarks) < min_landmarks.get(transform_type, 4):
             raise ValueError(f"Need at least {min_landmarks[transform_type]} "
                            f"landmark pairs for {transform_type} registration")
-        
+
         # Convert to SimpleITK images
         print("\nConverting images to SimpleITK format...")
         moving_sitk = self.numpy_to_sitk(moving_image, moving_spacing)
         fixed_sitk = self.numpy_to_sitk(fixed_image, fixed_spacing)
-        
+
         # Convert landmarks to physical coordinates
         # Note: landmarks are stored as (Z, Y, X) but SimpleITK expects (x, y, z)
         moving_points = []
         fixed_points = []
-        
+
         print("\nConverting landmarks to physical coordinates...")
         for i, (m_lm, f_lm) in enumerate(zip(moving_landmarks, fixed_landmarks), 1):
-            # Convert (Z,Y,X) to physical (x,y,z) 
+            # Convert (Z,Y,X) to physical (x,y,z)
             m_phys = [m_lm[2] * moving_spacing[0],  # X
                      m_lm[1] * moving_spacing[1],   # Y
                      m_lm[0] * moving_spacing[2]]   # Z
             f_phys = [f_lm[2] * fixed_spacing[0],   # X
                      f_lm[1] * fixed_spacing[1],    # Y
                      f_lm[0] * fixed_spacing[2]]    # Z
-            
+
             moving_points.extend(m_phys)
             fixed_points.extend(f_phys)
-            
+
             print(f"  Pair {i}:")
             print(f"    Moving (Z,Y,X): {m_lm} -> Physical (x,y,z): {m_phys}")
             print(f"    Fixed  (Z,Y,X): {f_lm} -> Physical (x,y,z): {f_phys}")
-        
+
         # Initialize transform based on type
         print(f"\nInitializing {transform_type} transform...")
         if transform_type == 'affine':
@@ -850,29 +882,29 @@ class LandmarkRegistration:
             transform = sitk.Euler3DTransform()
         else:
             raise ValueError(f"Unknown transform type: {transform_type}")
-        
+
         # Use landmark correspondence to initialize transform
         landmark_transform = sitk.LandmarkBasedTransformInitializer(
             transform,
             fixed_points,
             moving_points
         )
-        
+
         print("✓ Initial transformation computed")
         print(f"  Transform parameters: {landmark_transform.GetParameters()}")
-        
+
         # Compute registration errors
         errors = self.compute_landmark_error(
             moving_landmarks, fixed_landmarks, landmark_transform,
             moving_spacing, fixed_spacing
         )
-        
+
         print(f"\nLandmark registration errors (mm):")
         print(f"  Mean error: {errors.mean():.3f}")
         print(f"  Std error:  {errors.std():.3f}")
         print(f"  Min error:  {errors.min():.3f}")
         print(f"  Max error:  {errors.max():.3f}")
-        
+
         # Resample moving image to fixed image space
         print("\nResampling moving image to fixed space...")
         resampler = sitk.ResampleImageFilter()
@@ -880,14 +912,14 @@ class LandmarkRegistration:
         resampler.SetInterpolator(sitk.sitkLinear)
         resampler.SetTransform(landmark_transform)
         resampler.SetDefaultPixelValue(0)
-        
+
         registered_sitk = resampler.Execute(moving_sitk)
         registered_array = sitk.GetArrayFromImage(registered_sitk)
-        
+
         print("✓ Registration complete")
         print(f"  Registered image shape: {registered_array.shape}")
         print("="*70)
-        
+
         metrics = {
             'errors': errors,
             'mean_error': errors.mean(),
@@ -895,16 +927,16 @@ class LandmarkRegistration:
             'max_error': errors.max(),
             'min_error': errors.min()
         }
-        
+
         return registered_array, landmark_transform, metrics
-    
+
     def refine_registration(self, moving_image, fixed_image, initial_transform,
                           moving_spacing=(0.025, 0.025, 0.025),
                           fixed_spacing=(0.025, 0.025, 0.025),
                           iterations=200):
         """
         Refine registration using intensity-based optimization
-        
+
         Parameters:
         -----------
         moving_image : numpy.ndarray
@@ -919,7 +951,7 @@ class LandmarkRegistration:
             Voxel spacing for fixed image
         iterations : int
             Number of optimization iterations
-            
+
         Returns:
         --------
         tuple : (refined_image, refined_transform)
@@ -927,18 +959,18 @@ class LandmarkRegistration:
         print("\n" + "="*70)
         print("REFINING REGISTRATION WITH INTENSITY-BASED OPTIMIZATION")
         print("="*70)
-        
+
         moving_sitk = self.numpy_to_sitk(moving_image, moving_spacing)
         fixed_sitk = self.numpy_to_sitk(fixed_image, fixed_spacing)
-        
+
         # Setup registration method
         registration = sitk.ImageRegistrationMethod()
-        
+
         # Metric: Mutual Information
         registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
         registration.SetMetricSamplingStrategy(registration.RANDOM)
         registration.SetMetricSamplingPercentage(0.01)
-        
+
         # Optimizer
         registration.SetOptimizerAsGradientDescent(
             learningRate=1.0,
@@ -947,18 +979,18 @@ class LandmarkRegistration:
             convergenceWindowSize=10
         )
         registration.SetOptimizerScalesFromPhysicalShift()
-        
+
         # Interpolator
         registration.SetInterpolator(sitk.sitkLinear)
-        
+
         # Initial transform
         registration.SetInitialTransform(initial_transform, inPlace=False)
-        
+
         # Multi-resolution
         registration.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
         registration.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
         registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-        
+
         # Progress monitoring
         iteration_count = [0]
         def iteration_callback():
@@ -966,16 +998,16 @@ class LandmarkRegistration:
             if iteration_count[0] % 20 == 0:
                 print(f"  Iteration {iteration_count[0]}: "
                       f"Metric = {registration.GetMetricValue():.4f}")
-        
+
         registration.AddCommand(sitk.sitkIterationEvent, iteration_callback)
-        
+
         print("\nStarting optimization...")
         refined_transform = registration.Execute(fixed_sitk, moving_sitk)
-        
+
         print(f"\n✓ Optimization complete")
         print(f"  Final metric value: {registration.GetMetricValue():.4f}")
         print(f"  Optimizer stop condition: {registration.GetOptimizerStopConditionDescription()}")
-        
+
         # Apply refined transform
         print("\nApplying refined transform...")
         resampler = sitk.ResampleImageFilter()
@@ -983,19 +1015,19 @@ class LandmarkRegistration:
         resampler.SetInterpolator(sitk.sitkLinear)
         resampler.SetTransform(refined_transform)
         resampler.SetDefaultPixelValue(0)
-        
+
         refined_sitk = resampler.Execute(moving_sitk)
         refined_array = sitk.GetArrayFromImage(refined_sitk)
-        
+
         print("="*70)
-        
+
         return refined_array, refined_transform
-    
-    def visualize_registration(self, moving, fixed, registered, 
+
+    def visualize_registration(self, moving, fixed, registered,
                               slice_indices=None, save_name='landmark_registration'):
         """
         Visualize registration results across multiple slices
-        
+
         Parameters:
         -----------
         moving : numpy.ndarray
@@ -1013,119 +1045,119 @@ class LandmarkRegistration:
             # Use quartile slices
             nz = fixed.shape[0]
             slice_indices = [nz//4, nz//2, 3*nz//4]
-        
+
         n_slices = len(slice_indices)
         fig, axes = plt.subplots(n_slices, 4, figsize=(16, 4*n_slices))
-        
+
         if n_slices == 1:
             axes = axes.reshape(1, -1)
-        
-        fig.suptitle('Landmark-Based Registration Results', 
+
+        fig.suptitle('Landmark-Based Registration Results',
                     fontsize=16, fontweight='bold')
-        
+
         for i, slice_idx in enumerate(slice_indices):
             # Ensure slice is within bounds
             slice_idx = min(slice_idx, fixed.shape[0]-1)
-            
+
             # Get slice from moving (may have different size)
             if slice_idx < moving.shape[0]:
                 mov_slice = moving[slice_idx]
             else:
                 mov_slice = moving[moving.shape[0]//2]
-            
+
             fix_slice = fixed[slice_idx]
             reg_slice = registered[slice_idx]
-            
+
             # Original moving
             axes[i, 0].imshow(mov_slice, cmap='gray')
             axes[i, 0].set_title(f'Moving (Z-slice {slice_idx})')
             axes[i, 0].axis('off')
-            
+
             # Fixed
             axes[i, 1].imshow(fix_slice, cmap='gray')
             axes[i, 1].set_title(f'Fixed (Z-slice {slice_idx})')
             axes[i, 1].axis('off')
-            
+
             # Registered
             axes[i, 2].imshow(reg_slice, cmap='gray')
             axes[i, 2].set_title(f'Registered')
             axes[i, 2].axis('off')
-            
+
             # Overlay (magenta=fixed, green=registered)
             overlay = np.zeros((*fix_slice.shape, 3))
             fix_norm = (fix_slice - fix_slice.min()) / (fix_slice.max() - fix_slice.min() + 1e-8)
             reg_norm = (reg_slice - reg_slice.min()) / (reg_slice.max() - reg_slice.min() + 1e-8)
-            
+
             overlay[:, :, 0] = fix_norm  # Red channel (for magenta)
             overlay[:, :, 1] = reg_norm  # Green channel
             overlay[:, :, 2] = fix_norm  # Blue channel (for magenta)
-            
+
             axes[i, 3].imshow(overlay)
             axes[i, 3].set_title('Overlay (Magenta=Fixed, Green=Reg)')
             axes[i, 3].axis('off')
-        
+
         plt.tight_layout()
-        
+
         save_path = self.output_path / f"{save_name}.png"
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"\n✓ Visualization saved to: {save_path}")
         plt.show()
-    
-    def visualize_detailed(self, moving, fixed, registered, 
+
+    def visualize_detailed(self, moving, fixed, registered,
                           slice_idx=None, save_name='registration_detailed'):
         """
         Create detailed visualization with checkerboard and difference maps
         """
         if slice_idx is None:
             slice_idx = fixed.shape[0] // 2
-        
+
         fig = plt.figure(figsize=(16, 12))
-        
+
         # Get slices
         if slice_idx < moving.shape[0]:
             mov_slice = moving[slice_idx]
         else:
             mov_slice = moving[moving.shape[0]//2]
-        
+
         fix_slice = fixed[slice_idx]
         reg_slice = registered[slice_idx]
-        
+
         # Row 1: Original images
         ax1 = plt.subplot(3, 3, 1)
         ax1.imshow(mov_slice, cmap='gray')
         ax1.set_title('Original Moving')
         ax1.axis('off')
-        
+
         ax2 = plt.subplot(3, 3, 2)
         ax2.imshow(fix_slice, cmap='gray')
         ax2.set_title('Fixed (Allen CCF)')
         ax2.axis('off')
-        
+
         ax3 = plt.subplot(3, 3, 3)
         ax3.imshow(reg_slice, cmap='gray')
         ax3.set_title('Registered Moving')
         ax3.axis('off')
-        
+
         # Row 2: Overlays
         ax4 = plt.subplot(3, 3, 4)
         ax4.imshow(fix_slice, cmap='Purples', alpha=0.7)
         ax4.imshow(reg_slice, cmap='Greens', alpha=0.5)
         ax4.set_title('Color Overlay\n(Purple=Fixed, Green=Registered)')
         ax4.axis('off')
-        
+
         ax5 = plt.subplot(3, 3, 5)
         # Blend overlay
         blend = 0.5 * (fix_slice / fix_slice.max()) + 0.5 * (reg_slice / reg_slice.max())
         ax5.imshow(blend, cmap='gray')
         ax5.set_title('Blended Overlay')
         ax5.axis('off')
-        
+
         ax6 = plt.subplot(3, 3, 6)
         checker = self._create_checkerboard(fix_slice, reg_slice, n_tiles=8)
         ax6.imshow(checker, cmap='gray')
         ax6.set_title('Checkerboard')
         ax6.axis('off')
-        
+
         # Row 3: Difference and contours
         ax7 = plt.subplot(3, 3, 7)
         diff = np.abs(fix_slice.astype(float) - reg_slice.astype(float))
@@ -1133,7 +1165,7 @@ class LandmarkRegistration:
         ax7.set_title('Absolute Difference')
         ax7.axis('off')
         plt.colorbar(im, ax=ax7, fraction=0.046)
-        
+
         ax8 = plt.subplot(3, 3, 8)
         ax8.imshow(fix_slice, cmap='gray')
         # Add contours of registered image
@@ -1141,7 +1173,7 @@ class LandmarkRegistration:
         ax8.contour(reg_edges, levels=[reg_edges.mean()], colors='cyan', linewidths=2)
         ax8.set_title('Fixed + Registered Contours')
         ax8.axis('off')
-        
+
         ax9 = plt.subplot(3, 3, 9)
         # Difference histogram
         ax9.hist(diff.flatten(), bins=50, color='red', alpha=0.7)
@@ -1149,25 +1181,25 @@ class LandmarkRegistration:
         ax9.set_ylabel('Frequency')
         ax9.set_title('Difference Histogram')
         ax9.grid(True, alpha=0.3)
-        
+
         plt.suptitle(f'Detailed Registration Analysis (Z-slice {slice_idx})',
                     fontsize=14, fontweight='bold')
         plt.tight_layout()
-        
+
         save_path = self.output_path / f"{save_name}.png"
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"\n✓ Detailed visualization saved to: {save_path}")
         plt.show()
-    
+
     def _create_checkerboard(self, img1, img2, n_tiles=8):
         """Create checkerboard pattern of two images"""
         h, w = img1.shape
         tile_h, tile_w = h // n_tiles, w // n_tiles
-        
+
         # Normalize images
         img1_norm = (img1 - img1.min()) / (img1.max() - img1.min() + 1e-8)
         img2_norm = (img2 - img2.min()) / (img2.max() - img2.min() + 1e-8)
-        
+
         checker = np.zeros_like(img1_norm)
         for i in range(n_tiles):
             for j in range(n_tiles):
@@ -1177,14 +1209,14 @@ class LandmarkRegistration:
                 else:
                     checker[i*tile_h:(i+1)*tile_h, j*tile_w:(j+1)*tile_w] = \
                         img2_norm[i*tile_h:(i+1)*tile_h, j*tile_w:(j+1)*tile_w]
-        
+
         return checker
-    
+
     def save_transform(self, transform, filepath):
         """Save transform to file"""
         sitk.WriteTransform(transform, str(filepath))
         print(f"✓ Transform saved to: {filepath}")
-    
+
     def load_transform(self, filepath):
         """Load transform from file"""
         transform = sitk.ReadTransform(str(filepath))
@@ -1214,7 +1246,7 @@ def infer_spacing_um(image_path: Path) -> float | None:
     """Infer isotropic image spacing from a metadata sidecar if available."""
     sidecar_path = image_path.with_suffix(image_path.suffix + ".metadata.json")
     if sidecar_path.exists():
-        with open(sidecar_path, "r") as f:
+        with open(sidecar_path, "r", encoding="utf-8") as f:
             metadata = json.load(f)
 
         values = metadata.get("spacing_um_xyz") or metadata.get("spacing_um_zyx")
@@ -1301,17 +1333,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     PROJECT_PATH = resolve_project_path(args.project_path)
-    
+
     # Load data
     print("="*70)
     print("LOADING DATA")
     print("="*70)
     loader = DataLoader(PROJECT_PATH)
-    
+
     # Load microCT (use aligned and corrected version if available)
     corrected_file = PROJECT_PATH / "data" / "processed" / "microct_aligned_corrected.tif"
     aligned_file = PROJECT_PATH / "data" / "processed" / "microct_aligned_fullres.tif"
-    
+
     if corrected_file.exists():
         print(f"\nLoading axis-corrected microCT from: {corrected_file}")
         microct = tifffile.imread(corrected_file)
@@ -1330,21 +1362,21 @@ if __name__ == "__main__":
             iter(sorted(loader.data_path.glob("*.tif")) + sorted(loader.data_path.glob("*.tiff"))),
             None,
         )
-    
+
     # Load Allen CCF
     print(f"\nLoading Allen CCF atlas ({args.atlas_spacing:g}um resolution)...")
     loader.load_allen_ccf(resolution=int(args.atlas_spacing))
     atlas = loader.atlas_image
-    
+
     print(f"\nMicroCT shape (Z,Y,X): {microct.shape}")
     print(f"Atlas shape (Z,Y,X): {atlas.shape}")
-    
+
     # Preprocess microCT
     print("\n" + "="*70)
     print("PREPROCESSING")
     print("="*70)
     preprocessor = Preprocessor(PROJECT_PATH)
-    
+
     current_res = (
         args.microct_spacing
         if args.microct_spacing is not None
@@ -1368,32 +1400,32 @@ if __name__ == "__main__":
         print(f"\nKeeping microCT at native {current_res:g}um spacing.")
         print("Registration will use physical spacing instead of resampling.")
         microct_for_registration = microct
-    
+
     # Normalize intensity
     print("\nNormalizing intensity...")
     microct_normalized = preprocessor.normalize_intensity(
         microct_for_registration,
         method='percentile'
     )
-    
+
     # Normalize atlas
     atlas_normalized = atlas.astype(float) / atlas.max()
-    
+
     print(f"\nPreprocessed microCT shape (Z,Y,X): {microct_normalized.shape}")
     print(f"Note: Image axes should be correctly oriented after midline alignment")
-    
+
     # Interactive landmark selection
     print("\n" + "="*70)
     print("LANDMARK SELECTION")
     print("="*70)
-    
+
     selector = LandmarkSelector(
-        microct_normalized, 
+        microct_normalized,
         atlas_normalized,
         moving_name="MicroCT",
         fixed_name="Allen CCF"
     )
-    
+
     # Option to load existing landmarks
     landmark_file = PROJECT_PATH / "data" / "landmarks.json"
     if landmark_file.exists():
@@ -1407,20 +1439,20 @@ if __name__ == "__main__":
     else:
         moving_lm, fixed_lm = selector.select_landmarks()
         selector.save_landmarks(landmark_file)
-    
+
     # Perform registration
     if len(moving_lm) >= 4 and len(moving_lm) == len(fixed_lm):
         registrar = LandmarkRegistration(PROJECT_PATH)
-        
+
         # Initial landmark-based registration
         print("\n" + "="*70)
         print("PERFORMING LANDMARK REGISTRATION")
         print("="*70)
-        
+
         registered, transform, metrics = registrar.landmark_registration(
-            microct_normalized, 
+            microct_normalized,
             atlas_normalized,
-            moving_lm, 
+            moving_lm,
             fixed_lm,
             moving_spacing=(moving_spacing_um / 1000.0,) * 3,
             fixed_spacing=(target_res / 1000.0,) * 3,
@@ -1454,28 +1486,28 @@ if __name__ == "__main__":
             'transform_saved_direction': 'fixed-to-moving',
             'landmark_file': str(landmark_file),
         }
-        with open(metrics_file, 'w') as f:
+        with open(metrics_file, 'w', encoding="utf-8") as f:
             json.dump(metrics_data, f, indent=2)
 
         print(f"\n✓ Registered image saved to: {output_file}")
         print(f"✓ Transform saved to: {transform_file}")
         print(f"✓ Metrics saved to: {metrics_file}")
-        
+
         # Visualize results
         registrar.visualize_registration(
-            microct_normalized, 
-            atlas_normalized, 
+            microct_normalized,
+            atlas_normalized,
             registered,
             save_name='03_landmark_registration'
         )
-        
+
         registrar.visualize_detailed(
             microct_normalized,
             atlas_normalized,
             registered,
             save_name='03_landmark_registration_detailed'
         )
-        
+
         # Option to refine with intensity-based registration
         refine = input("\nRefine registration with intensity-based optimization? (y/n): ")
         if refine.lower() == 'y':
@@ -1487,7 +1519,7 @@ if __name__ == "__main__":
                 fixed_spacing=(target_res / 1000.0,) * 3,
                 iterations=200
             )
-            
+
             # Visualize refined results
             registrar.visualize_registration(
                 microct_normalized,
@@ -1495,27 +1527,27 @@ if __name__ == "__main__":
                 refined,
                 save_name='04_refined_registration'
             )
-            
+
             registrar.visualize_detailed(
                 microct_normalized,
                 atlas_normalized,
                 refined,
                 save_name='04_refined_registration_detailed'
             )
-            
+
             # Save refined results
             output_file = PROJECT_PATH / "data" / "processed" / "microct_registered_refined.tif"
             output_file.parent.mkdir(exist_ok=True, parents=True)
             tifffile.imwrite(output_file, (refined * 65535).astype(np.uint16))
             print(f"\n✓ Refined registered image saved to: {output_file}")
-            
+
             # Save refined transform
             transform_file = PROJECT_PATH / "data" / "processed" / "transform_refined.tfm"
             registrar.save_transform(refined_transform, transform_file)
         else:
             refined = registered
             refined_transform = transform
-        
+
         print("\n" + "="*70)
         print("REGISTRATION COMPLETE")
         print("="*70)
@@ -1529,7 +1561,7 @@ if __name__ == "__main__":
         print(f"  - Metrics: {metrics_file}")
         print(f"  - Visualizations: {registrar.output_path}")
         print("="*70)
-        
+
     else:
         print("\nWARNING: Not enough valid landmark pairs selected.")
         print(f"   Moving: {len(moving_lm)}, Fixed: {len(fixed_lm)}")
