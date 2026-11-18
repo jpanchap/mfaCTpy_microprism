@@ -178,12 +178,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Convert a DICOM slice folder to a 3D TIFF in (Z, Y, X) order.")
     parser.add_argument("dicom_folder", help="Folder containing DICOM .dcm files.")
-    parser.add_argument("output_path", help="Output TIFF path.")
+    parser.add_argument(
+        "output_path", nargs="?",
+        help="Output TIFF path. Defaults to data/volumes.tif inside the DICOM folder.")
     parser.add_argument("--no-normalize", action="store_true",
                         help="Keep raw DICOM intensities instead of scaling to 0-1.")
     args = parser.parse_args()
 
+    dicom_folder = Path(args.dicom_folder).expanduser().resolve()
+    output_path = (
+        Path(args.output_path).expanduser().resolve()
+        if args.output_path else dicom_folder / "data" / "volumes.tif"
+    )
+    print(f"Output TIFF: {output_path}")
     volume, metadata = load_dicom_volume(
-        args.dicom_folder, normalize=not args.no_normalize)
-    save_volume_as_tif(volume, args.output_path)
-    write_metadata_sidecar(metadata, args.output_path)
+        dicom_folder, normalize=not args.no_normalize)
+    save_volume_as_tif(volume, output_path)
+    write_metadata_sidecar(metadata, output_path)
+    if output_path.parent.name == "data":
+        print(f"For later pipeline steps, use project folder: {output_path.parent.parent}")
